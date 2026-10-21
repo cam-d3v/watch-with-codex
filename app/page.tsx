@@ -33,6 +33,7 @@ const DEFAULT_OBSERVATION_INTERVAL_SECONDS = 5;
 const VIEWER_REACTION_COOLDOWN_MS = 3_000;
 const MAX_AGENT_REACTIONS = 5;
 const DEFAULT_LOOK_MODE = 'moments';
+const LOOK_SETTINGS_KEY = 'watch-with-gpt:look-settings';
 const KEY_MOMENT_FALLBACK_SECONDS = 60;
 // Look this long after a seek lands, so the new frame has rendered.
 const SEEK_SETTLE_SECONDS = 2.5;
@@ -40,7 +41,15 @@ const SEEK_SETTLE_SECONDS = 2.5;
 const OBSERVER_HEARTBEAT_MS = 30_000;
 // End the loop if playback stays paused this long.
 const PAUSE_LIMIT_MS = 10 * 60_000;
-const CAPTURE_WAKES: readonly string[] = ['look_request', 'user_signal', 'interval', 'key_moment'];
+const WAKE_LABELS: Record<WakeReason, string> = {
+  look_request: 'Look now',
+  user_signal: 'emoji',
+  interval: 'interval',
+  key_moment: 'key moment',
+  playback_event: 'play/pause/seek',
+  heartbeat: 'heartbeat',
+};
+const CAPTURE_WAKES: readonly string[] =['look_request', 'user_signal', 'interval', 'key_moment'];
 
 const WATCH_PROTOCOL = {
   role: 'Share the open video with the user as a natural viewing companion.',
@@ -49,7 +58,11 @@ const WATCH_PROTOCOL = {
   observation:
     'When the user asks you to watch, run each observation as one programmatic browser call: await watch_observe_next_moment and, only if observation.capture is true, capture the rendered .player-frame in the very next browser operation; return the observation (and image, if captured) together. Never yield to model reasoning between the WebMCP result and the capture. Repeat in the same turn. The observer follows play, pause, and seek and keeps waiting while paused, so a pause does not end the watch-along. It wakes on the look mode schedule, when the viewer presses Look now or sends an emoji, on playback events, and on a short heartbeat. If the viewer asks out loud to look at something, capture .player-frame right away, answer, then resume observing. Stop only when the user asks or the observer returns an error.',
   lookModes:
-    'request: capture only when the viewer asks (Look now, emoji, or voice). moments: capture shortly after seeks and periodically as a fallback. interval: capture every few seconds of playback. The viewer can change this on the page, or you can change it with watch_configure when they ask.',
+    'request: capture only when the viewer asks (Look now, emoji, or voice). moments: capture shortly after seeks and periodically as a fallback. interval: capture every few seconds of playback. Keep the viewer\'s selected mode; change it with watch_configure only when they ask.',
+  captureBadge:
+    'When an observation has capture: true, the player shows a small badge with that observation\'s seq and timecode for a few seconds. If a captured image shows a different seq, or no badge, treat it as stale or delayed.',
+  statusCheck:
+    'Use watch_get_status for a cheap check of playback state; do not re-read watch_get_session just to see whether the video is moving.',
   behavior: [
     'Stay quiet by default.',
     'Do not comment on every observation.',
@@ -139,6 +152,12 @@ type WakeReason =
 type ObservationWake =
   | { reason: WakeReason; signal: UserSignal | null }
   | { reason: 'cancelled' | 'ended' | 'stop_at' | 'paused_too_long' | 'session_changed' };
+
+type ObserverStatus = {
+  waiting: boolean;
+  endedAt: number;
+  last: { seq: number; reason: WakeReason; capture: boolean; timecode: string | null } | null;
+};
 
 type ObservationWaiter = {
   timerId: number;
@@ -705,6 +724,19 @@ export default function Home() {
   // When the current run of observer calls began; a gap of over a minute starts a new run.
   const loopStartedAtRef = useRef(0);
   const lastObserveAtRef = useRef(0);
+  const observationSeqRef = useRef(0);
+  const [observerStatus, setObserverStatus] = useState<ObserverStatus>({
+    waiting: false,
+    endedAt: 0,
+    last: null,
+  });
+  const [statusNow, setStatusNow] = useState(0);
+  // Shown inside .player-frame when a look is requested, so the captured image
+  // carries its own sequence number and timecode.
+  const [captureBadge, setCaptureBadge] = useState<{ seq: number; timecode: string | null } | null>(
+    null,
+  );
+  const captureBadgeTimerRef = useRef<number | null>(null);
 
   const changeStopAt = useCallback((text: string) => {
     const seconds = parseTimeInput(text);
@@ -724,9 +756,44 @@ export default function Home() {
       }
       // Restart the schedule from the current position under the new mode.
       if (observationCursorRef.current) observationCursorRef.current.nextCheckpointTime = null;
+      try {
+        window.localStorage.setItem(
+          LOOK_SETTINGS_KEY,
+          JSON.stringify({ mode, intervalSeconds: observationIntervalRef.current }),
+        );
+      } catch {
+        // Storage can be unavailable (private window); the setting just won't persist.
+      }
     },
     [],
   );
+
+  // Called when a video opens; the look controls only exist on the watch screen.
+  const restoreLookMode = useCallback(() => {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(LOOK_SETTINGS_KEY) ?? 'null') as {
+        mode?: unknown;
+        intervalSeconds?: unknown;
+      } | null;
+      if (saved && ['request', 'moments', 'interval'].includes(saved.mode as string)) {
+        const interval = OBSERVATION_INTERVALS_SECONDS.includes(
+          saved.intervalSeconds as ObservationIntervalSeconds,
+        )
+          ? (saved.intervalSeconds as ObservationIntervalSeconds)
+          : undefined;
+        changeLookMode(saved.mode as LookMode, interval);
+      }
+    } catch {
+      // Ignore unreadable storage and keep the current mode.
+    }
+  }, [changeLookMode]);
+
+  // Tick so the observer status line can age "responding" into "not following".
+  useEffect(() => {
+    if (!observerStatus.last) return;
+    const intervalId = window.setInterval(() => setStatusNow(Date.now()), 5_000);
+    return () => window.clearInterval(intervalId);
+  }, [observerStatus.last]);
 
   const pushTimeline = useCallback((event: TimelineEvent) => {
     timelineRef.current = [...timelineRef.current.slice(-19), event];
@@ -1098,6 +1165,29 @@ export default function Home() {
         }),
       },
       {
+        name: 'watch_get_status',
+        description:
+          'Cheap check of the current playback state, look mode, and stop-at time. Use this instead of watch_get_session to confirm whether the video is moving.',
+        inputSchema: noInputSchema,
+        annotations: { readOnlyHint: true },
+        execute: async () => {
+          const current = playbackRef.current;
+          return {
+            ok: true,
+            status: current.status,
+            timecode: formatTimecode(current.currentTime),
+            durationTimecode: formatTimecode(current.duration),
+            lookMode: lookModeRef.current,
+            ...(lookModeRef.current === 'interval'
+              ? { intervalSeconds: observationIntervalRef.current }
+              : {}),
+            stopAtTimecode: formatTimecode(stopAtRef.current ?? Number.NaN),
+            lastObservationSeq: observationSeqRef.current,
+            observerWaiting: observationWaiterRef.current !== null,
+          };
+        },
+      },
+      {
         name: 'watch_observe_next_moment',
         description:
           'Continue an active watch-along. Run it inside one programmatic browser call: await this tool, and if observation.capture is true, capture the rendered .player-frame in the very next browser operation; return the observation (and image, if captured) together with no model reasoning in between. When capture is false, do not capture. The observer waits through pauses and wakes on the look-mode schedule, a viewer Look now request or emoji, play/pause/seek events (listed in observation.events), or a 30-second heartbeat. Use the frame and conversation to decide whether to stay quiet, react, or comment; always acknowledge a viewer emoji or look request. Keep calling it in the same turn until the user asks you to stop or it returns an error (ok: false). A new call safely replaces a pending one.',
@@ -1138,9 +1228,14 @@ export default function Home() {
             cursor.nextCheckpointTime = initial.currentTime + Math.min(period, 5);
           }
 
+          setObserverStatus((status) => ({ ...status, waiting: true }));
           const wake = await waitForObservationWake(observedSource);
           lastObserveAtRef.current = Date.now();
           const current = playbackRef.current;
+          // A superseded call leaves the newer call's waiting state alone.
+          if (wake.reason !== 'cancelled') {
+            setObserverStatus((status) => ({ ...status, waiting: false, endedAt: Date.now() }));
+          }
           if (wake.reason === 'cancelled') {
             return webMcpError(
               'OBSERVATION_SUPERSEDED',
@@ -1180,6 +1275,20 @@ export default function Home() {
           if (capture && current.currentTime !== null) {
             cursor.nextCheckpointTime = current.currentTime + period;
           }
+          const seq = ++observationSeqRef.current;
+          const timecode = formatTimecode(current.currentTime);
+          setObserverStatus({
+            waiting: false,
+            endedAt: Date.now(),
+            last: { seq, reason: wake.reason as WakeReason, capture, timecode },
+          });
+          if (capture) {
+            setCaptureBadge({ seq, timecode });
+            if (captureBadgeTimerRef.current !== null) {
+              window.clearTimeout(captureBadgeTimerRef.current);
+            }
+            captureBadgeTimerRef.current = window.setTimeout(() => setCaptureBadge(null), 4_000);
+          }
 
           // Kept deliberately small: this payload repeats all session and
           // accumulates in the conversation. The full protocol lives in
@@ -1188,10 +1297,11 @@ export default function Home() {
           return {
             ok: true,
             observation: {
+              seq,
               wakeReason: wake.reason,
               capture,
               status: current.status,
-              timecode: formatTimecode(current.currentTime),
+              timecode,
               ...(signal?.emoji ? { signal: { emoji: signal.emoji, timecode: signal.timecode } } : {}),
               ...(events.length > 0 ? { events } : {}),
               next: capture
@@ -1219,6 +1329,7 @@ export default function Home() {
               playbackRef.current,
             );
           }
+          const requestedAt = performance.now();
           const played = await controller.play();
           if (!played) {
             return webMcpError(
@@ -1230,7 +1341,11 @@ export default function Home() {
           // YouTube buffers briefly before playing; report the settled state.
           const playing = await waitForStatus(playbackRef, ['playing'], 6_000);
           return playing
-            ? { ok: true, playback: publicPlaybackState(playbackRef.current) }
+            ? {
+                ok: true,
+                confirmedInMs: Math.round(performance.now() - requestedAt),
+                playback: publicPlaybackState(playbackRef.current),
+              }
             : webMcpError(
                 'PLAY_NOT_STARTED',
                 'Play was requested but the video has not started yet (still buffering, or the browser blocked autoplay). Ask the viewer to press play.',
@@ -1252,11 +1367,16 @@ export default function Home() {
               playbackRef.current,
             );
           }
+          const requestedAt = performance.now();
           const paused =
             (await controller.pause()) &&
             (await waitForStatus(playbackRef, ['paused', 'ended'], 2_000));
           return paused
-            ? { ok: true, playback: publicPlaybackState(playbackRef.current) }
+            ? {
+                ok: true,
+                confirmedInMs: Math.round(performance.now() - requestedAt),
+                playback: publicPlaybackState(playbackRef.current),
+              }
             : webMcpError(
                 'PAUSE_REJECTED',
                 'The player rejected the pause request.',
@@ -1408,6 +1528,8 @@ export default function Home() {
   }, [changeLookMode, changeStopAt, publishVisualReactions, releaseObservation, waitForObservationWake]);
 
   function resetTimeline() {
+    setObserverStatus({ waiting: false, endedAt: 0, last: null });
+    setCaptureBadge(null);
     observationCursorRef.current = null;
     timelineRef.current = [];
     settledStatusRef.current = null;
@@ -1451,6 +1573,7 @@ export default function Home() {
       resetTimeline();
       sourceStartRef.current = parsedSource.kind === 'embed' ? null : parsedSource.startSeconds;
       changeStopAt(plannedStop !== null ? plannedStopText.trim() : '');
+      restoreLookMode();
       setSource(parsedSource);
       setMediaMetadata(nextMetadata);
       mediaMetadataRef.current = nextMetadata;
@@ -1566,6 +1689,11 @@ export default function Home() {
             controllerRef={controllerRef}
             onPlayback={updatePlayback}
           />
+          {captureBadge ? (
+            <span className="capture-badge" aria-hidden="true">
+              #{captureBadge.seq} · {captureBadge.timecode}
+            </span>
+          ) : null}
           <div className="reaction-layer" aria-live="polite" aria-atomic="false">
             {reactions.map((reaction) => (
               <span
@@ -1721,6 +1849,18 @@ export default function Home() {
             {stopAtSeconds !== null ? ` · pauses at ${formatTimecode(stopAtSeconds)?.slice(0, -2)}` : ''}
           </p>
         )}
+        {source.kind !== 'embed' && (observerStatus.waiting || observerStatus.last) ? (
+          <p className="player-note observer-status">
+            {observerStatus.waiting
+              ? 'GPT is following along'
+              : statusNow - observerStatus.endedAt < OBSERVER_HEARTBEAT_MS + 15_000
+                ? 'GPT is responding'
+                : 'GPT is not following right now'}
+            {observerStatus.last
+              ? ` · last check #${observerStatus.last.seq} at ${observerStatus.last.timecode?.slice(0, -2) ?? '—'} (${WAKE_LABELS[observerStatus.last.reason]}${observerStatus.last.capture ? ', look requested' : ''})`
+              : ''}
+          </p>
+        ) : null}
       </section>
     </main>
   );
