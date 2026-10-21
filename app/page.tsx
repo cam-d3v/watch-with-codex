@@ -434,16 +434,26 @@ function playerCaptureTarget() {
     rect.left >= -1 &&
     rect.bottom <= window.innerHeight + 1 &&
     rect.right <= window.innerWidth + 1;
+  const ratio = window.devicePixelRatio;
+  const scaled = (value: number) => Math.round(value * ratio * 100) / 100;
   return {
     selector: '.player-frame',
+    videoOnly: getComputedStyle(frame).position === 'fixed',
     clip: {
       x: Math.round(rect.left),
       y: Math.round(rect.top),
       width: Math.round(rect.width),
       height: Math.round(rect.height),
     },
-    viewport: { width: window.innerWidth, height: window.innerHeight },
-    devicePixelRatio: Math.round(window.devicePixelRatio * 100) / 100,
+    // ChatGPT's browser screenshot clip was verified to take device pixels
+    // (CSS pixels x devicePixelRatio); precomputed to avoid arithmetic slips.
+    scaledClip: {
+      x: scaled(rect.left),
+      y: scaled(rect.top),
+      width: scaled(rect.width),
+      height: scaled(rect.height),
+    },
+    devicePixelRatio: Math.round(ratio * 100) / 100,
     // Scroll is irrelevant when Video only pins the player in place.
     ...((window.scrollX || window.scrollY) && getComputedStyle(frame).position !== 'fixed'
       ? { scroll: { x: Math.round(window.scrollX), y: Math.round(window.scrollY) } }
@@ -1596,7 +1606,7 @@ export default function Home() {
             liveSignals:
               'A viewer emoji or Look now press wakes watch_observe_next_moment immediately with capture: true. It is intentional input inside the active watch-along, never an implicit request to pause or stop. Acknowledge it from the frame and conversation context, then continue observing in the same turn.',
             visualCapture:
-              'Capture only when observation.capture is true, or when the viewer asks you to look, in the same programmatic browser call that awaited the observer, with no model reasoning in between. Capture only the video. Prefer an element screenshot of captureTarget.selector (.player-frame). Otherwise clip with captureTarget.clip: CSS pixels relative to the top-left of the visible viewport (not the document; scroll is already accounted for). If your screenshot is measured in device pixels, multiply the clip by captureTarget.devicePixelRatio. If a clipped image is misaligned or fullyVisible is false, call watch_configure with videoOnly: true: the player is then pinned to the viewport top-left at exactly 16:9, so the clip is x 0, y 0. Never capture the full page; it wastes tokens and includes unrelated UI. The frame includes the video, captions, and player overlays.',
+              'Capture only when observation.capture is true, or when the viewer asks you to look, in the same programmatic browser call that awaited the observer, with no model reasoning in between. Capture only the video, in this order of preference: (1) an element screenshot of captureTarget.selector (.player-frame), e.g. a locator screenshot, which needs no coordinates; (2) with Video only on (captureTarget.videoOnly true; turn it on with watch_configure videoOnly: true), clip the screenshot with captureTarget.scaledClip. This combination was verified in ChatGPT\'s browser; (3) on the normal page, clip with captureTarget.scaledClip taken from the observation you are answering (layout can change between observations). scaledClip is clip (CSS pixels, relative to the visible viewport) times devicePixelRatio. Verify each image: the "#seq · timecode" badge should sit in the top-right corner of the video; if it is missing or the image shows page controls, switch to Video only. Never capture the full page; it wastes tokens and includes unrelated UI. The frame includes the video, captions, and player overlays.',
             videoOnly: videoOnlyRef.current,
           },
         }),
@@ -2476,18 +2486,37 @@ export default function Home() {
       {videoOnly ? (
         // Invisible until hovered, so viewport screenshots still show only the video.
         <div className="video-only-bar">
-          <button type="button" onClick={() => changeVideoOnly(false)}>
+          {/* Blur after clicking so the bar fades out before the next screenshot. */}
+          <button
+            type="button"
+            onClick={(event) => {
+              event.currentTarget.blur();
+              changeVideoOnly(false);
+            }}
+          >
             Exit video only (Esc)
           </button>
-          <button type="button" onClick={() => publishUserSignal('look')}>
+          <button
+            type="button"
+            onClick={(event) => {
+              event.currentTarget.blur();
+              publishUserSignal('look');
+            }}
+          >
             Look now
           </button>
-          <button type="button" onClick={markMoment}>
+          <button
+            type="button"
+            onClick={(event) => {
+              event.currentTarget.blur();
+              markMoment();
+            }}
+          >
             Mark
           </button>
         </div>
       ) : null}
-      <header className="watch-header">
+      <header className="watch-header" inert={videoOnly}>
         <button type="button" className="wordmark" onClick={reset}>
           Watch with GPT
         </button>
@@ -2534,7 +2563,7 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="watch-controls">
+          <div className="watch-controls" inert={videoOnly}>
             <div className="reaction-picker-shell" ref={reactionMenuRef}>
               <div className="reaction-picker" aria-label="React to this moment">
                 {PRIMARY_REACTION_EMOJIS.map((emoji) => (
@@ -2683,18 +2712,18 @@ export default function Home() {
           </div>
 
           {source.kind === 'embed' ? (
-            <p className="player-note">
+            <p className="player-note" inert={videoOnly}>
               This player is shown as provided. Shared timing and playback controls may be unavailable.
             </p>
           ) : (
-            <p className="player-note" data-playback-status={playbackStatus}>
+            <p className="player-note" data-playback-status={playbackStatus} inert={videoOnly}>
               {playbackStatus === 'playing' ? 'Playing together' : 'Ready when you are'}
               {source.startSeconds ? ` · starts at ${formatTimecode(source.startSeconds)?.slice(0, -2)}` : ''}
               {stopAtSeconds !== null ? ` · pauses at ${formatTimecode(stopAtSeconds)?.slice(0, -2)}` : ''}
             </p>
           )}
           {source.kind !== 'embed' && (observerStatus.waiting || observerStatus.last) ? (
-            <p className="player-note observer-status">
+            <p className="player-note observer-status" inert={videoOnly}>
               {observerStatus.waiting
                 ? 'GPT is following along'
                 : statusNow - observerStatus.endedAt < OBSERVER_HEARTBEAT_MS + 15_000
@@ -2706,7 +2735,7 @@ export default function Home() {
             </p>
           ) : null}
           {source.kind !== 'embed' ? (
-            <div className="transcript-bar">
+            <div className="transcript-bar" inert={videoOnly}>
               <span>
                 {transcript.status === 'loading'
                   ? 'Captions: loading…'
@@ -2762,7 +2791,7 @@ export default function Home() {
         </section>
 
         {notesOpen ? (
-          <aside className="notes-panel" id="notes-panel" aria-label="Notes">
+          <aside className="notes-panel" id="notes-panel" aria-label="Notes" inert={videoOnly}>
             <div className="notes-header">
               <h2>Notes</h2>
               <div className="notes-actions">

@@ -547,8 +547,10 @@ h1 {
   transition: opacity 150ms ease;
 }
 
+/* Keyboard focus reveals the bar; mouse and scripted clicks do not, so it
+   stays out of screenshots. */
 .video-only-bar:hover,
-.video-only-bar:focus-within {
+.video-only-bar:has(:focus-visible) {
   opacity: 1;
 }
 
