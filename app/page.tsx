@@ -41,15 +41,37 @@ const SEEK_SETTLE_SECONDS = 2.5;
 const OBSERVER_HEARTBEAT_MS = 30_000;
 // End the loop if playback stays paused this long.
 const PAUSE_LIMIT_MS = 10 * 60_000;
+const NOTES_KEY_PREFIX = 'watch-with-gpt:notes:';
+const MAX_NOTE_LENGTH = 2_000;
+// Label a note as written late when GPT describes a moment this long after it.
+const NOTE_LATE_SECONDS = 5;
 const WAKE_LABELS: Record<WakeReason, string> = {
   look_request: 'Look now',
+  mark_request: 'Mark',
   user_signal: 'emoji',
   interval: 'interval',
   key_moment: 'key moment',
   playback_event: 'play/pause/seek',
   heartbeat: 'heartbeat',
 };
-const CAPTURE_WAKES: readonly string[] =['look_request', 'user_signal', 'interval', 'key_moment'];
+// The one-line reminder each observation carries, by wake reason.
+const NEXT_STEP: Record<WakeReason, string> = {
+  look_request: 'The viewer asked you to look. Capture .player-frame now, respond, then observe again.',
+  mark_request:
+    'The viewer marked this moment. Capture .player-frame, call watch_add_note with markId and a one-line description, then observe again.',
+  user_signal: 'Capture .player-frame, briefly acknowledge the emoji, then observe again.',
+  interval: 'Capture .player-frame; comment only if worthwhile. Then observe again.',
+  key_moment: 'Capture .player-frame; comment only if worthwhile. Then observe again.',
+  playback_event: 'No capture needed. Observe again.',
+  heartbeat: 'No capture needed. Observe again.',
+};
+const CAPTURE_WAKES: readonly string[] = [
+  'look_request',
+  'mark_request',
+  'user_signal',
+  'interval',
+  'key_moment',
+];
 
 const WATCH_PROTOCOL = {
   role: 'Share the open video with the user as a natural viewing companion.',
@@ -61,6 +83,8 @@ const WATCH_PROTOCOL = {
     'request: capture only when the viewer asks (Look now, emoji, or voice). moments: capture shortly after seeks and periodically as a fallback. interval: capture every few seconds of playback. Keep the viewer\'s selected mode; change it with watch_configure only when they ask.',
   captureBadge:
     'When an observation has capture: true, the player shows a small badge with that observation\'s seq and timecode for a few seconds. If a captured image shows a different seq, or no badge, treat it as stale or delayed.',
+  notes:
+    'The page keeps timestamped notes beside the video. When the viewer says "mark this" or "note that…", call watch_add_note right away; if you write it after the moment has passed, pass the timecode of when they asked. When the viewer presses Mark, the observer returns mark_request with a markId: capture the frame and describe it with watch_add_note. Use watch_get_notes to recall earlier notes.',
   statusCheck:
     'Use watch_get_status for a cheap check of playback state; do not re-read watch_get_session just to see whether the video is moving.',
   behavior: [
@@ -116,6 +140,7 @@ type PlaybackSnapshot = {
 type PlayerController = {
   play: () => Promise<boolean>;
   pause: () => Promise<boolean>;
+  seek: (seconds: number) => void;
 };
 
 type ReactionEmoji = (typeof REACTION_EMOJIS)[number];
@@ -126,10 +151,31 @@ type ObservationIntervalSeconds = (typeof OBSERVATION_INTERVALS_SECONDS)[number]
 // interval: look every 5/10/15 seconds of playback.
 type LookMode = 'request' | 'moments' | 'interval';
 
+type Note = {
+  id: string;
+  // The moment the note is about.
+  time: number | null;
+  // Playback position when the text was written; differs from time when GPT
+  // describes a moment after the fact.
+  writtenAt: number | null;
+  text: string;
+  // mark: the viewer pressed Mark and GPT is asked to describe the moment.
+  source: 'viewer' | 'gpt' | 'mark';
+  observationSeq: number | null;
+  createdAt: string;
+};
+
+type StoredNotes = {
+  title: string | null;
+  url: string;
+  notes: Note[];
+};
+
 type UserSignal = {
   id: string;
-  kind: 'emoji' | 'look';
+  kind: 'emoji' | 'look' | 'mark';
   emoji: ReactionEmoji | null;
+  markId?: string;
   createdAt: string;
   playbackTime: number | null;
   timecode: string | null;
@@ -143,6 +189,7 @@ type TimelineEvent = {
 
 type WakeReason =
   | 'look_request'
+  | 'mark_request'
   | 'user_signal'
   | 'interval'
   | 'key_moment'
@@ -201,6 +248,7 @@ type ModelContext = {
 type YouTubePlayer = {
   playVideo: () => void;
   pauseVideo: () => void;
+  seekTo: (seconds: number, allowSeekAhead: boolean) => void;
   getCurrentTime: () => number;
   getDuration: () => number;
   getPlayerState: () => number;
@@ -284,7 +332,7 @@ function parseTimeInput(value: string): number | null {
   const text = value.trim().toLowerCase();
   if (!text) return null;
 
-  if (/^\d+(:\d{1,2}){0,2}$/.test(text)) {
+  if (/^\d+(:\d{1,2}){0,2}(\.\d+)?$/.test(text)) {
     return text.split(':').reduce((total, part) => total * 60 + Number(part), 0);
   }
 
@@ -292,6 +340,67 @@ function parseTimeInput(value: string): number | null {
   if (!units || !units.slice(1).some(Boolean)) return null;
   const [hours, minutes, seconds] = units.slice(1).map((part) => Number(part ?? 0));
   return hours * 3600 + minutes * 60 + seconds;
+}
+
+function signalWakeReason(signal: UserSignal): WakeReason {
+  if (signal.kind === 'look') return 'look_request';
+  if (signal.kind === 'mark') return 'mark_request';
+  return 'user_signal';
+}
+
+function shortTimecode(value: number | null) {
+  return formatTimecode(value)?.slice(0, -2) ?? '—';
+}
+
+function notesStorageKey(source: VideoSource) {
+  return NOTES_KEY_PREFIX + (source.kind === 'youtube' ? source.videoId : source.url);
+}
+
+function loadStoredNotes(source: VideoSource): Note[] {
+  try {
+    const stored = JSON.parse(
+      window.localStorage.getItem(notesStorageKey(source)) ?? 'null',
+    ) as StoredNotes | null;
+    return Array.isArray(stored?.notes) ? stored.notes : [];
+  } catch {
+    return [];
+  }
+}
+
+function noteWrittenLateSeconds(note: Note) {
+  if (note.time === null || note.writtenAt === null) return 0;
+  const late = note.writtenAt - note.time;
+  return late > NOTE_LATE_SECONDS ? Math.round(late) : 0;
+}
+
+function noteLink(source: VideoSource, time: number | null) {
+  if (time === null) return null;
+  if (source.kind === 'youtube') {
+    return `https://www.youtube.com/watch?v=${source.videoId}&t=${Math.floor(time)}s`;
+  }
+  return source.kind === 'direct' ? `${source.url.split('#')[0]}#t=${Math.floor(time)}` : null;
+}
+
+function notesToMarkdown(source: VideoSource, title: string | null, notes: Note[]) {
+  const lines = [
+    `# Notes: ${title ?? 'Untitled video'}`,
+    '',
+    `Source: ${source.url}`,
+    `Exported: ${new Date().toLocaleString()}`,
+    '',
+  ];
+  for (const note of [...notes].sort((a, b) => (a.time ?? 0) - (b.time ?? 0))) {
+    const stamp = shortTimecode(note.time);
+    const link = noteLink(source, note.time);
+    const late = noteWrittenLateSeconds(note);
+    const by =
+      note.source === 'viewer' ? 'me' : note.source === 'mark' ? 'marked by me, described by GPT' : 'GPT';
+    const details = [by, late ? `written ${late}s later` : null].filter(Boolean).join(', ');
+    lines.push(
+      `- **${link ? `[${stamp}](${link})` : stamp}** ${note.text || '(marked, no description yet)'} _(${details})_`,
+    );
+  }
+  return lines.join('\n') + '\n';
 }
 
 function publicPlaybackState(snapshot: PlaybackSnapshot) {
@@ -525,6 +634,7 @@ function YouTubeSurface({
                   player?.pauseVideo();
                   return true;
                 },
+                seek: (seconds) => player?.seekTo(seconds, true),
               };
               report();
               intervalId = window.setInterval(report, 250);
@@ -600,6 +710,9 @@ function DirectVideoSurface({
         if (!video) return false;
         video.pause();
         return true;
+      },
+      seek: (seconds: number) => {
+        if (videoRef.current) videoRef.current.currentTime = seconds;
       },
     };
 
@@ -737,6 +850,49 @@ export default function Home() {
     null,
   );
   const captureBadgeTimerRef = useRef<number | null>(null);
+  const [notes, setNotes] = useState<Note[]>([]);
+  const notesRef = useRef<Note[]>([]);
+  const [notesOpen, setNotesOpen] = useState(true);
+  const [noteDraft, setNoteDraft] = useState('');
+  const [notesMessage, setNotesMessage] = useState('');
+  const noteSequenceRef = useRef(0);
+  const sourceRef = useRef<VideoSource | null>(null);
+
+  // Single place notes change: updates state, the ref the tools read, and storage.
+  const commitNotes = useCallback((next: Note[]) => {
+    notesRef.current = next;
+    setNotes(next);
+    const currentSource = sourceRef.current;
+    if (!currentSource) return;
+    try {
+      const stored: StoredNotes = {
+        title: mediaMetadataRef.current?.title ?? null,
+        url: currentSource.url,
+        notes: next,
+      };
+      window.localStorage.setItem(notesStorageKey(currentSource), JSON.stringify(stored));
+    } catch {
+      setNotesMessage('Notes could not be saved in this browser. Download them to keep a copy.');
+    }
+  }, []);
+
+  const createNote = useCallback(
+    (fields: Pick<Note, 'text' | 'source'> & Partial<Pick<Note, 'time' | 'observationSeq'>>) => {
+      const now = finiteTime(playbackRef.current.currentTime ?? Number.NaN);
+      const note: Note = {
+        id: `note-${Date.now()}-${noteSequenceRef.current++}`,
+        time: fields.time === undefined ? now : fields.time,
+        writtenAt: fields.source === 'mark' ? null : now,
+        text: fields.text.slice(0, MAX_NOTE_LENGTH),
+        source: fields.source,
+        observationSeq: fields.observationSeq ?? null,
+        createdAt: new Date().toISOString(),
+      };
+      commitNotes([...notesRef.current, note]);
+      return note;
+    },
+    [commitNotes],
+  );
 
   const changeStopAt = useCallback((text: string) => {
     const seconds = parseTimeInput(text);
@@ -1008,23 +1164,19 @@ export default function Home() {
   }, []);
 
   const publishUserSignal = useCallback(
-    (kind: UserSignal['kind'], emoji: ReactionEmoji | null = null) => {
+    (kind: UserSignal['kind'], emoji: ReactionEmoji | null = null, markId?: string) => {
       const playbackTime = finiteTime(playbackRef.current.currentTime ?? Number.NaN);
       const signal: UserSignal = {
         id: `signal-${Date.now()}-${signalSequenceRef.current++}`,
         kind,
         emoji,
+        ...(markId ? { markId } : {}),
         createdAt: new Date().toISOString(),
         playbackTime,
         timecode: formatTimecode(playbackTime),
       };
 
-      if (
-        !releaseObservation({
-          reason: kind === 'look' ? 'look_request' : 'user_signal',
-          signal,
-        })
-      ) {
+      if (!releaseObservation({ reason: signalWakeReason(signal), signal })) {
         pendingSignalsRef.current = [...pendingSignalsRef.current.slice(-19), signal];
       }
     },
@@ -1063,10 +1215,7 @@ export default function Home() {
 
       const queuedSignal = pendingSignalsRef.current.shift();
       if (queuedSignal) {
-        return {
-          reason: queuedSignal.kind === 'look' ? 'look_request' : 'user_signal',
-          signal: queuedSignal,
-        };
+        return { reason: signalWakeReason(queuedSignal), signal: queuedSignal };
       }
 
       const events = timelineRef.current;
@@ -1303,14 +1452,9 @@ export default function Home() {
               status: current.status,
               timecode,
               ...(signal?.emoji ? { signal: { emoji: signal.emoji, timecode: signal.timecode } } : {}),
+              ...(signal?.markId ? { markId: signal.markId, markTimecode: signal.timecode } : {}),
               ...(events.length > 0 ? { events } : {}),
-              next: capture
-                ? wake.reason === 'look_request'
-                  ? 'The viewer asked you to look. Capture .player-frame now, respond, then observe again.'
-                  : wake.reason === 'user_signal'
-                    ? 'Capture .player-frame, briefly acknowledge the emoji, then observe again.'
-                    : 'Capture .player-frame; comment only if worthwhile. Then observe again.'
-                : 'No capture needed. Observe again.',
+              next: NEXT_STEP[wake.reason as WakeReason],
             },
           };
         },
@@ -1448,6 +1592,99 @@ export default function Home() {
         },
       },
       {
+        name: 'watch_add_note',
+        description:
+          'Save a timestamped note in the viewer\'s notes panel. Use it when the viewer says "mark this", "note that…", or asks you to remember something, and to describe a moment the viewer marked (pass the observation\'s markId). If you are writing about an earlier moment, pass its timecode so the note points there; the page labels notes written well after their moment. Keep notes short and factual. This visibly changes the page and is saved.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            text: { type: 'string', description: 'The note, ideally one or two sentences.' },
+            markId: {
+              type: 'string',
+              description: 'markId from a mark_request observation, to describe that mark.',
+            },
+            timecode: {
+              type: 'string',
+              description: 'Moment the note is about, e.g. "00:01:34.3". Defaults to now.',
+            },
+            observationSeq: {
+              type: 'number',
+              description: 'seq of the observation whose frame this note describes, if any.',
+            },
+          },
+          required: ['text'],
+          additionalProperties: false,
+        },
+        execute: async (input) => {
+          if (!sourceRef.current) {
+            return webMcpError('NO_VIDEO', 'No video is open.', playbackRef.current);
+          }
+          const options = (typeof input === 'object' && input !== null ? input : {}) as {
+            text?: unknown;
+            markId?: unknown;
+            timecode?: unknown;
+            observationSeq?: unknown;
+          };
+          const text = typeof options.text === 'string' ? options.text.trim() : '';
+          if (!text) {
+            return webMcpError('INVALID_NOTE', 'text is required.', playbackRef.current);
+          }
+          const observationSeq =
+            typeof options.observationSeq === 'number' ? options.observationSeq : null;
+          const now = finiteTime(playbackRef.current.currentTime ?? Number.NaN);
+
+          if (typeof options.markId === 'string') {
+            const mark = notesRef.current.find((note) => note.id === options.markId);
+            if (!mark) {
+              return webMcpError('MARK_NOT_FOUND', 'No mark with that markId exists.', playbackRef.current);
+            }
+            const described: Note = {
+              ...mark,
+              text: text.slice(0, MAX_NOTE_LENGTH),
+              writtenAt: now,
+              observationSeq: observationSeq ?? mark.observationSeq,
+            };
+            commitNotes(notesRef.current.map((note) => (note.id === mark.id ? described : note)));
+            return { ok: true, noteId: described.id, timecode: formatTimecode(described.time) };
+          }
+
+          let time = now;
+          if (typeof options.timecode === 'string' && options.timecode.trim()) {
+            time = parseTimeInput(options.timecode);
+            if (time === null) {
+              return webMcpError(
+                'INVALID_NOTE',
+                'timecode must look like "00:01:34.3", "1:34", or "94".',
+                playbackRef.current,
+              );
+            }
+          }
+          const note = createNote({ text, source: 'gpt', time, observationSeq });
+          return { ok: true, noteId: note.id, timecode: formatTimecode(note.time) };
+        },
+      },
+      {
+        name: 'watch_get_notes',
+        description:
+          'Read the viewer\'s notes for this video, oldest moment first. Use it to recall what was noted earlier, for example after the conversation has lost older context.',
+        inputSchema: noInputSchema,
+        annotations: { readOnlyHint: true },
+        execute: async () => ({
+          ok: true,
+          notes: [...notesRef.current]
+            .sort((a, b) => (a.time ?? 0) - (b.time ?? 0))
+            .map((note) => ({
+              id: note.id,
+              timecode: formatTimecode(note.time),
+              text: note.text || null,
+              by: note.source,
+              ...(noteWrittenLateSeconds(note)
+                ? { writtenLaterSeconds: noteWrittenLateSeconds(note) }
+                : {}),
+            })),
+        }),
+      },
+      {
         name: 'watch_react',
         description:
           'Publish between one and five lightweight visual reactions together at the current playback moment. Use a small burst only when it genuinely fits or the user requests it; do not react to every observation. The user’s requested viewing style has priority. This visibly changes the page.',
@@ -1525,7 +1762,61 @@ export default function Home() {
       }
       delete document.documentElement.dataset.siteTools;
     };
-  }, [changeLookMode, changeStopAt, publishVisualReactions, releaseObservation, waitForObservationWake]);
+  }, [
+    changeLookMode,
+    changeStopAt,
+    commitNotes,
+    createNote,
+    publishVisualReactions,
+    releaseObservation,
+    waitForObservationWake,
+  ]);
+
+  function markMoment() {
+    const mark = createNote({ text: '', source: 'mark' });
+    setNotesOpen(true);
+    publishUserSignal('mark', null, mark.id);
+  }
+
+  function addViewerNote(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const text = noteDraft.trim();
+    if (!text) return;
+    createNote({ text, source: 'viewer' });
+    setNoteDraft('');
+  }
+
+  function deleteNote(id: string) {
+    commitNotes(notesRef.current.filter((note) => note.id !== id));
+  }
+
+  function jumpToNote(note: Note) {
+    if (note.time !== null) controllerRef.current?.seek(note.time);
+  }
+
+  function notesMarkdown() {
+    return source ? notesToMarkdown(source, mediaMetadata?.title ?? null, notesRef.current) : '';
+  }
+
+  function downloadNotes() {
+    const title = mediaMetadata?.title ?? 'video';
+    const fileName = `${title.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'video'}-notes.md`;
+    const url = URL.createObjectURL(new Blob([notesMarkdown()], { type: 'text/markdown' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  }
+
+  async function copyNotes() {
+    try {
+      await navigator.clipboard.writeText(notesMarkdown());
+      setNotesMessage('Copied as Markdown.');
+    } catch {
+      setNotesMessage('Copy was blocked by the browser. Use Download instead.');
+    }
+  }
 
   function resetTimeline() {
     setObserverStatus({ waiting: false, endedAt: 0, last: null });
@@ -1574,6 +1865,12 @@ export default function Home() {
       sourceStartRef.current = parsedSource.kind === 'embed' ? null : parsedSource.startSeconds;
       changeStopAt(plannedStop !== null ? plannedStopText.trim() : '');
       restoreLookMode();
+      sourceRef.current = parsedSource;
+      const savedNotes = loadStoredNotes(parsedSource);
+      notesRef.current = savedNotes;
+      setNotes(savedNotes);
+      setNoteDraft('');
+      setNotesMessage('');
       setSource(parsedSource);
       setMediaMetadata(nextMetadata);
       mediaMetadataRef.current = nextMetadata;
@@ -1598,6 +1895,9 @@ export default function Home() {
     playbackSampleRef.current = null;
     resetTimeline();
     sourceStartRef.current = null;
+    sourceRef.current = null;
+    notesRef.current = [];
+    setNotes([]);
     changeStopAt('');
     setPlaybackStatus('idle');
     setReactions([]);
@@ -1672,196 +1972,298 @@ export default function Home() {
   }
 
   return (
-    <main className="watch-screen">
+    <main className="watch-screen" data-notes-open={notesOpen}>
       <header className="watch-header">
         <button type="button" className="wordmark" onClick={reset}>
           Watch with GPT
         </button>
-        <button type="button" className="change-video" onClick={reset}>
-          Change video
-        </button>
-      </header>
-
-      <section className="watch-stage" aria-label="Shared video">
-        <div className="player-frame">
-          <PlayerSurface
-            source={source}
-            controllerRef={controllerRef}
-            onPlayback={updatePlayback}
-          />
-          {captureBadge ? (
-            <span className="capture-badge" aria-hidden="true">
-              #{captureBadge.seq} · {captureBadge.timecode}
-            </span>
-          ) : null}
-          <div className="reaction-layer" aria-live="polite" aria-atomic="false">
-            {reactions.map((reaction) => (
-              <span
-                key={reaction.id}
-                className="floating-reaction"
-                data-source={reaction.source}
-                style={{ left: `${reaction.left}%` }}
-              >
-                {reaction.emoji}
-              </span>
-            ))}
-          </div>
-        </div>
-
-        <div className="watch-controls">
-          <div className="reaction-picker-shell" ref={reactionMenuRef}>
-            <div className="reaction-picker" aria-label="React to this moment">
-              {PRIMARY_REACTION_EMOJIS.map((emoji) => (
-                <button
-                  type="button"
-                  key={emoji}
-                  className="reaction-button"
-                  aria-label={`React with ${emoji}`}
-                  disabled={viewerReactionCoolingDown}
-                  onClick={() => publishUserReaction(emoji)}
-                >
-                  {emoji}
-                </button>
-              ))}
-              <button
-                type="button"
-                className="reaction-button more-reactions-button"
-                aria-label={reactionMenuOpen ? 'Close more reactions' : 'Show more reactions'}
-                aria-expanded={reactionMenuOpen}
-                aria-controls="more-reactions"
-                onClick={() => setReactionMenuOpen((open) => !open)}
-              >
-                <span aria-hidden="true">…</span>
-              </button>
-            </div>
-
-            {reactionMenuOpen ? (
-              <div
-                className="reaction-popover"
-                id="more-reactions"
-                role="dialog"
-                aria-label="More reactions"
-              >
-                <div className="reaction-popover-header">
-                  <span>Reactions</span>
-                  <button
-                    type="button"
-                    className="reaction-popover-close"
-                    aria-label="Close reactions"
-                    onClick={() => setReactionMenuOpen(false)}
-                  >
-                    ×
-                  </button>
-                </div>
-                <div className="reaction-grid">
-                  {REACTION_EMOJIS.map((emoji) => (
-                    <button
-                      type="button"
-                      key={emoji}
-                      className="reaction-button"
-                      aria-label={`React with ${emoji}`}
-                      disabled={viewerReactionCoolingDown}
-                      onClick={() => publishUserReaction(emoji)}
-                    >
-                      {emoji}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-            <span className="sr-only" aria-live="polite">
-              {viewerReactionCoolingDown ? 'You can react again in three seconds.' : ''}
-            </span>
-          </div>
-
-          <div className="observation-picker" aria-label="When GPT looks at the video">
-            <span>Look</span>
-            <button
-              type="button"
-              className="interval-button"
-              data-active={lookMode === 'request'}
-              aria-pressed={lookMode === 'request'}
-              title="Only when you press Look now, send an emoji, or ask out loud"
-              onClick={() => changeLookMode('request')}
-            >
-              On request
-            </button>
-            <button
-              type="button"
-              className="interval-button"
-              data-active={lookMode === 'moments'}
-              aria-pressed={lookMode === 'moments'}
-              title={`On request, after you jump to a new spot, and every ${KEY_MOMENT_FALLBACK_SECONDS}s as a fallback`}
-              onClick={() => changeLookMode('moments')}
-            >
-              Key moments
-            </button>
-            {OBSERVATION_INTERVALS_SECONDS.map((seconds) => {
-              const active = lookMode === 'interval' && seconds === observationIntervalSeconds;
-              return (
-                <button
-                  type="button"
-                  key={seconds}
-                  className="interval-button"
-                  data-active={active}
-                  aria-pressed={active}
-                  title={`Every ${seconds} seconds of playback`}
-                  onClick={() => changeLookMode('interval', seconds)}
-                >
-                  {seconds}s
-                </button>
-              );
-            })}
-          </div>
-
+        <div className="watch-header-actions">
           <button
             type="button"
-            className="look-now-button"
-            onClick={() => publishUserSignal('look')}
-            title="Ask GPT to look at the current frame"
+            className="change-video"
+            aria-expanded={notesOpen}
+            aria-controls="notes-panel"
+            onClick={() => setNotesOpen((open) => !open)}
           >
-            Look now
+            {notesOpen ? 'Hide notes' : `Notes${notes.length ? ` (${notes.length})` : ''}`}
           </button>
+          <button type="button" className="change-video" onClick={reset}>
+            Change video
+          </button>
+        </div>
+      </header>
 
-          {source.kind !== 'embed' ? (
-            <label className="time-field">
-              <span>Stop at</span>
+      <div className="watch-body">
+        <section className="watch-stage" aria-label="Shared video">
+          <div className="player-frame">
+            <PlayerSurface
+              source={source}
+              controllerRef={controllerRef}
+              onPlayback={updatePlayback}
+            />
+            {captureBadge ? (
+              <span className="capture-badge" aria-hidden="true">
+                #{captureBadge.seq} · {captureBadge.timecode}
+              </span>
+            ) : null}
+            <div className="reaction-layer" aria-live="polite" aria-atomic="false">
+              {reactions.map((reaction) => (
+                <span
+                  key={reaction.id}
+                  className="floating-reaction"
+                  data-source={reaction.source}
+                  style={{ left: `${reaction.left}%` }}
+                >
+                  {reaction.emoji}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          <div className="watch-controls">
+            <div className="reaction-picker-shell" ref={reactionMenuRef}>
+              <div className="reaction-picker" aria-label="React to this moment">
+                {PRIMARY_REACTION_EMOJIS.map((emoji) => (
+                  <button
+                    type="button"
+                    key={emoji}
+                    className="reaction-button"
+                    aria-label={`React with ${emoji}`}
+                    disabled={viewerReactionCoolingDown}
+                    onClick={() => publishUserReaction(emoji)}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  className="reaction-button more-reactions-button"
+                  aria-label={reactionMenuOpen ? 'Close more reactions' : 'Show more reactions'}
+                  aria-expanded={reactionMenuOpen}
+                  aria-controls="more-reactions"
+                  onClick={() => setReactionMenuOpen((open) => !open)}
+                >
+                  <span aria-hidden="true">…</span>
+                </button>
+              </div>
+
+              {reactionMenuOpen ? (
+                <div
+                  className="reaction-popover"
+                  id="more-reactions"
+                  role="dialog"
+                  aria-label="More reactions"
+                >
+                  <div className="reaction-popover-header">
+                    <span>Reactions</span>
+                    <button
+                      type="button"
+                      className="reaction-popover-close"
+                      aria-label="Close reactions"
+                      onClick={() => setReactionMenuOpen(false)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div className="reaction-grid">
+                    {REACTION_EMOJIS.map((emoji) => (
+                      <button
+                        type="button"
+                        key={emoji}
+                        className="reaction-button"
+                        aria-label={`React with ${emoji}`}
+                        disabled={viewerReactionCoolingDown}
+                        onClick={() => publishUserReaction(emoji)}
+                      >
+                        {emoji}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              <span className="sr-only" aria-live="polite">
+                {viewerReactionCoolingDown ? 'You can react again in three seconds.' : ''}
+              </span>
+            </div>
+
+            <div className="observation-picker" aria-label="When GPT looks at the video">
+              <span>Look</span>
+              <button
+                type="button"
+                className="interval-button"
+                data-active={lookMode === 'request'}
+                aria-pressed={lookMode === 'request'}
+                title="Only when you press Look now, send an emoji, or ask out loud"
+                onClick={() => changeLookMode('request')}
+              >
+                On request
+              </button>
+              <button
+                type="button"
+                className="interval-button"
+                data-active={lookMode === 'moments'}
+                aria-pressed={lookMode === 'moments'}
+                title={`On request, after you jump to a new spot, and every ${KEY_MOMENT_FALLBACK_SECONDS}s as a fallback`}
+                onClick={() => changeLookMode('moments')}
+              >
+                Key moments
+              </button>
+              {OBSERVATION_INTERVALS_SECONDS.map((seconds) => {
+                const active = lookMode === 'interval' && seconds === observationIntervalSeconds;
+                return (
+                  <button
+                    type="button"
+                    key={seconds}
+                    className="interval-button"
+                    data-active={active}
+                    aria-pressed={active}
+                    title={`Every ${seconds} seconds of playback`}
+                    onClick={() => changeLookMode('interval', seconds)}
+                  >
+                    {seconds}s
+                  </button>
+                );
+              })}
+            </div>
+
+            <button
+              type="button"
+              className="look-now-button"
+              onClick={() => publishUserSignal('look')}
+              title="Ask GPT to look at the current frame"
+            >
+              Look now
+            </button>
+            {source.kind !== 'embed' ? (
+              <button
+                type="button"
+                className="look-now-button"
+                onClick={markMoment}
+                title="Save a note at this moment and ask GPT to describe it"
+              >
+                Mark
+              </button>
+            ) : null}
+
+            {source.kind !== 'embed' ? (
+              <label className="time-field">
+                <span>Stop at</span>
+                <input
+                  type="text"
+                  value={stopAtText}
+                  onChange={(event) => changeStopAt(event.target.value)}
+                  placeholder="h:mm:ss"
+                  aria-invalid={Boolean(stopAtText.trim()) && stopAtSeconds === null}
+                  title="Pause automatically at this time, e.g. 1:00:00 or 45m"
+                />
+              </label>
+            ) : null}
+          </div>
+
+          {source.kind === 'embed' ? (
+            <p className="player-note">
+              This player is shown as provided. Shared timing and playback controls may be unavailable.
+            </p>
+          ) : (
+            <p className="player-note" data-playback-status={playbackStatus}>
+              {playbackStatus === 'playing' ? 'Playing together' : 'Ready when you are'}
+              {source.startSeconds ? ` · starts at ${formatTimecode(source.startSeconds)?.slice(0, -2)}` : ''}
+              {stopAtSeconds !== null ? ` · pauses at ${formatTimecode(stopAtSeconds)?.slice(0, -2)}` : ''}
+            </p>
+          )}
+          {source.kind !== 'embed' && (observerStatus.waiting || observerStatus.last) ? (
+            <p className="player-note observer-status">
+              {observerStatus.waiting
+                ? 'GPT is following along'
+                : statusNow - observerStatus.endedAt < OBSERVER_HEARTBEAT_MS + 15_000
+                  ? 'GPT is responding'
+                  : 'GPT is not following right now'}
+              {observerStatus.last
+                ? ` · last check #${observerStatus.last.seq} at ${observerStatus.last.timecode?.slice(0, -2) ?? '—'} (${WAKE_LABELS[observerStatus.last.reason]}${observerStatus.last.capture ? ', look requested' : ''})`
+                : ''}
+            </p>
+          ) : null}
+        </section>
+
+        {notesOpen ? (
+          <aside className="notes-panel" id="notes-panel" aria-label="Notes">
+            <div className="notes-header">
+              <h2>Notes</h2>
+              <div className="notes-actions">
+                <button type="button" onClick={copyNotes} disabled={notes.length === 0}>
+                  Copy
+                </button>
+                <button type="button" onClick={downloadNotes} disabled={notes.length === 0}>
+                  Download .md
+                </button>
+              </div>
+            </div>
+
+            {notes.length === 0 ? (
+              <p className="notes-empty">
+                Press Mark, type a note below, or say &ldquo;mark this&rdquo; to GPT. Notes save
+                automatically for this video.
+              </p>
+            ) : (
+              <ol className="notes-list">
+                {[...notes]
+                  .sort((a, b) => (a.time ?? 0) - (b.time ?? 0))
+                  .map((note) => {
+                    const late = noteWrittenLateSeconds(note);
+                    return (
+                      <li key={note.id} className="note" data-source={note.source}>
+                        <button
+                          type="button"
+                          className="note-time"
+                          onClick={() => jumpToNote(note)}
+                          disabled={note.time === null || source.kind === 'embed'}
+                          title="Jump to this moment"
+                        >
+                          {shortTimecode(note.time)}
+                        </button>
+                        <div className="note-body">
+                          <p className="note-text" data-pending={!note.text}>
+                            {note.text ||
+                              (note.source === 'mark' ? 'Marked. Waiting for GPT to describe it…' : '')}
+                          </p>
+                          <p className="note-meta">
+                            {note.source === 'viewer' ? 'You' : note.source === 'mark' ? 'Your mark' : 'GPT'}
+                            {note.source === 'mark' && note.text ? ', described by GPT' : ''}
+                            {note.observationSeq !== null ? ` · check #${note.observationSeq}` : ''}
+                            {late ? ` · written ${late}s later` : ''}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          className="note-delete"
+                          onClick={() => deleteNote(note.id)}
+                          aria-label={`Delete note at ${shortTimecode(note.time)}`}
+                        >
+                          ×
+                        </button>
+                      </li>
+                    );
+                  })}
+              </ol>
+            )}
+
+            <form className="note-form" onSubmit={addViewerNote}>
               <input
                 type="text"
-                value={stopAtText}
-                onChange={(event) => changeStopAt(event.target.value)}
-                placeholder="h:mm:ss"
-                aria-invalid={Boolean(stopAtText.trim()) && stopAtSeconds === null}
-                title="Pause automatically at this time, e.g. 1:00:00 or 45m"
+                value={noteDraft}
+                onChange={(event) => setNoteDraft(event.target.value)}
+                placeholder="Add a note at the current moment"
+                maxLength={MAX_NOTE_LENGTH}
+                aria-label="New note"
               />
-            </label>
-          ) : null}
-        </div>
-
-        {source.kind === 'embed' ? (
-          <p className="player-note">
-            This player is shown as provided. Shared timing and playback controls may be unavailable.
-          </p>
-        ) : (
-          <p className="player-note" data-playback-status={playbackStatus}>
-            {playbackStatus === 'playing' ? 'Playing together' : 'Ready when you are'}
-            {source.startSeconds ? ` · starts at ${formatTimecode(source.startSeconds)?.slice(0, -2)}` : ''}
-            {stopAtSeconds !== null ? ` · pauses at ${formatTimecode(stopAtSeconds)?.slice(0, -2)}` : ''}
-          </p>
-        )}
-        {source.kind !== 'embed' && (observerStatus.waiting || observerStatus.last) ? (
-          <p className="player-note observer-status">
-            {observerStatus.waiting
-              ? 'GPT is following along'
-              : statusNow - observerStatus.endedAt < OBSERVER_HEARTBEAT_MS + 15_000
-                ? 'GPT is responding'
-                : 'GPT is not following right now'}
-            {observerStatus.last
-              ? ` · last check #${observerStatus.last.seq} at ${observerStatus.last.timecode?.slice(0, -2) ?? '—'} (${WAKE_LABELS[observerStatus.last.reason]}${observerStatus.last.capture ? ', look requested' : ''})`
-              : ''}
-          </p>
+              <button type="submit" disabled={!noteDraft.trim()}>
+                Add
+              </button>
+            </form>
+            {notesMessage ? <p className="notes-message">{notesMessage}</p> : null}
+          </aside>
         ) : null}
-      </section>
+      </div>
     </main>
   );
 }
