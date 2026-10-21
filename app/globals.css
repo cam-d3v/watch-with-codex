@@ -729,6 +729,66 @@ h1 {
   height: 30px;
 }
 
+.transcript-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 6px 14px;
+  margin-top: 6px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.transcript-bar select {
+  height: 24px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.follow-speech {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+
+.transcript-file {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.transcript-file:hover,
+.transcript-file:focus-within {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.transcript-file input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.note-excerpt {
+  display: -webkit-box;
+  margin: 5px 0 0;
+  padding-left: 8px;
+  overflow: hidden;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
 .notes-message {
   margin: 8px 0 0;
   color: var(--text-tertiary);

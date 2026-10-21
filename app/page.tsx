@@ -8,6 +8,15 @@ import {
   useRef,
   useState,
 } from 'react';
+import {
+  cuesBetween,
+  excerptAround,
+  formatSpeech,
+  parseSubtitleFile,
+  TranscriptCue,
+  TranscriptTrackInfo,
+  VISUAL_REFERENCE,
+} from './transcript';
 
 const PRIMARY_REACTION_EMOJIS = ['😂', '❓', '💀', '😭', '❤️'] as const;
 const REACTION_EMOJIS = [
@@ -35,6 +44,10 @@ const MAX_AGENT_REACTIONS = 5;
 const DEFAULT_LOOK_MODE = 'moments';
 const LOOK_SETTINGS_KEY = 'watch-with-gpt:look-settings';
 const KEY_MOMENT_FALLBACK_SECONDS = 60;
+// Minimum playback gap between a capture and a speech-triggered one.
+const SPEECH_TRIGGER_GAP_SECONDS = 8;
+// Largest transcript window one call may return, to bound tokens.
+const MAX_TRANSCRIPT_WINDOW_SECONDS = 600;
 // Look this long after a seek lands, so the new frame has rendered.
 const SEEK_SETTLE_SECONDS = 2.5;
 // Return a no-capture result this often so a pending call never sits for minutes.
@@ -87,6 +100,8 @@ const WATCH_PROTOCOL = {
     'When an observation has capture: true, the player shows a small badge with that observation\'s seq and timecode for a few seconds. If a captured image shows a different seq, or no badge, treat it as stale or delayed.',
   notes:
     'The page keeps timestamped notes beside the video. When the viewer says "mark this" or "note that…", call watch_add_note right away; if you write it after the moment has passed, pass the timecode of when they asked. When the viewer presses Mark, the observer returns mark_request with a markId: capture the frame and describe it with watch_add_note. Use watch_get_notes to recall earlier notes.',
+  transcript:
+    'When captions are available, each observation carries newSpeech: what was said since the previous observation, as timestamped paragraphs. Follow the explanation from newSpeech and use screenshots for what must be seen (slides, diagrams, code). Use watch_get_transcript to re-read a window and watch_search_transcript to find where something was said. Auto-generated captions can contain recognition errors; check the transcript source before quoting. Never reveal speech beyond the current position unless the viewer asks.',
   statusCheck:
     'Use watch_get_status for a cheap check of playback state; do not re-read watch_get_session just to see whether the video is moving.',
   behavior: [
@@ -166,7 +181,32 @@ type Note = {
   // The check-in whose frame the note describes, and where playback was then.
   observationSeq: number | null;
   observationTime?: number | null;
+  // What was being said around `time`, captured from the transcript.
+  excerpt?: string;
   createdAt: string;
+};
+
+type TranscriptState = {
+  status: 'idle' | 'loading' | 'ready' | 'unavailable';
+  // The video this transcript belongs to; results for an older video are dropped.
+  sourceUrl: string | null;
+  origin: 'youtube' | 'file' | null;
+  track: TranscriptTrackInfo | null;
+  fileName: string | null;
+  availableTracks: TranscriptTrackInfo[];
+  cues: TranscriptCue[];
+  message: string;
+};
+
+const EMPTY_TRANSCRIPT: TranscriptState = {
+  status: 'idle',
+  sourceUrl: null,
+  origin: null,
+  track: null,
+  fileName: null,
+  availableTracks: [],
+  cues: [],
+  message: '',
 };
 
 type StoredNotes = {
@@ -201,7 +241,7 @@ type WakeReason =
   | 'heartbeat';
 
 type ObservationWake =
-  | { reason: WakeReason; signal: UserSignal | null }
+  | { reason: WakeReason; signal: UserSignal | null; trigger?: string }
   | { reason: 'cancelled' | 'ended' | 'stop_at' | 'paused_too_long' | 'session_changed' };
 
 type ObserverStatus = {
@@ -346,6 +386,26 @@ function parseTimeInput(value: string): number | null {
   return hours * 3600 + minutes * 60 + seconds;
 }
 
+// Where the captions came from, so the agent can judge their reliability.
+function transcriptProvenance(transcript: TranscriptState) {
+  if (transcript.origin === 'file') {
+    return { source: 'subtitle file loaded by the viewer', fileName: transcript.fileName };
+  }
+  return {
+    source:
+      transcript.track?.kind === 'auto-generated'
+        ? 'YouTube auto-generated captions (may contain recognition errors)'
+        : 'YouTube uploaded captions',
+    language: transcript.track?.languageCode ?? null,
+    trackName: transcript.track?.name ?? null,
+  };
+}
+
+function transcriptUnavailableMessage(transcript: TranscriptState) {
+  if (transcript.status === 'loading') return 'The transcript is still loading. Try again shortly.';
+  return transcript.message || 'No transcript is loaded for this video.';
+}
+
 // Where the video is on the page, so the agent can screenshot just the player.
 function playerCaptureTarget() {
   const frame = document.querySelector('.player-frame');
@@ -427,6 +487,7 @@ function notesToMarkdown(source: VideoSource, title: string | null, notes: Note[
     lines.push(
       `- **${link ? `[${stamp}](${link})` : stamp}** ${note.text || '(marked, no description yet)'} _(${details})_`,
     );
+    if (note.excerpt) lines.push(`  > ${note.excerpt}`);
   }
   return lines.join('\n') + '\n';
 }
@@ -866,6 +927,8 @@ export default function Home() {
   const loopStartedAtRef = useRef(0);
   const lastObserveAtRef = useRef(0);
   const observationSeqRef = useRef(0);
+  // Playback time of the last observation that requested a capture.
+  const lastCaptureTimeRef = useRef(-Infinity);
   const [observerStatus, setObserverStatus] = useState<ObserverStatus>({
     waiting: false,
     endedAt: 0,
@@ -889,6 +952,14 @@ export default function Home() {
   const observationTimesRef = useRef(new Map<number, number | null>());
   const [videoOnly, setVideoOnly] = useState(false);
   const videoOnlyRef = useRef(false);
+  const [transcript, setTranscript] = useState<TranscriptState>(EMPTY_TRANSCRIPT);
+  const transcriptRef = useRef<TranscriptState>(EMPTY_TRANSCRIPT);
+  const [followSpeech, setFollowSpeech] = useState(true);
+  const followSpeechRef = useRef(true);
+  // Playback time up to which speech has been sent to the agent.
+  const speechCursorRef = useRef<number | null>(null);
+  // Playback time up to which the transcript was scanned for visual references.
+  const visualScanRef = useRef<number | null>(null);
 
   const changeVideoOnly = useCallback((enabled: boolean) => {
     videoOnlyRef.current = enabled;
@@ -938,11 +1009,112 @@ export default function Home() {
             : null,
         createdAt: new Date().toISOString(),
       };
+      const transcriptCues = transcriptRef.current.cues;
+      if (note.time !== null && transcriptCues.length > 0) {
+        note.excerpt = excerptAround(transcriptCues, note.time) || undefined;
+      }
       commitNotes([...notesRef.current, note]);
       return note;
     },
     [commitNotes],
   );
+
+  const commitTranscript = useCallback(
+    (next: TranscriptState) => {
+      // Drop results that arrive after the viewer switched videos.
+      if (next.sourceUrl !== sourceRef.current?.url) return;
+      transcriptRef.current = next;
+      setTranscript(next);
+      speechCursorRef.current = null;
+      visualScanRef.current = null;
+      if (next.status !== 'ready') return;
+      // Notes made before the transcript arrived get their excerpt now.
+      if (notesRef.current.some((note) => note.excerpt === undefined && note.time !== null)) {
+        commitNotes(
+          notesRef.current.map((note) =>
+            note.excerpt === undefined && note.time !== null
+              ? { ...note, excerpt: excerptAround(next.cues, note.time) || undefined }
+              : note,
+          ),
+        );
+      }
+    },
+    [commitNotes],
+  );
+
+  const loadYouTubeTranscript = useCallback(
+    async (videoSource: Extract<VideoSource, { kind: 'youtube' }>, language?: string) => {
+      const base = { ...EMPTY_TRANSCRIPT, sourceUrl: videoSource.url, origin: 'youtube' as const };
+      commitTranscript({ ...base, status: 'loading', message: 'Loading captions…' });
+      try {
+        const query = new URLSearchParams({ videoId: videoSource.videoId });
+        if (language) query.set('lang', language);
+        const response = await fetch(`/api/youtube-transcript?${query}`);
+        const payload = (await response.json()) as {
+          ok?: boolean;
+          track?: TranscriptTrackInfo;
+          availableTracks?: TranscriptTrackInfo[];
+          cues?: TranscriptCue[];
+          error?: { message?: string };
+        };
+        if (!payload.ok || !payload.track || !Array.isArray(payload.cues)) {
+          commitTranscript({
+            ...base,
+            status: 'unavailable',
+            availableTracks: payload.availableTracks ?? [],
+            message: payload.error?.message ?? 'Captions are unavailable.',
+          });
+          return;
+        }
+        commitTranscript({
+          ...base,
+          status: 'ready',
+          track: payload.track,
+          availableTracks: payload.availableTracks ?? [],
+          cues: payload.cues,
+        });
+      } catch {
+        commitTranscript({
+          ...base,
+          status: 'unavailable',
+          message: 'Captions could not be loaded. You can load a subtitle file instead.',
+        });
+      }
+    },
+    [commitTranscript],
+  );
+
+  async function loadTranscriptFile(file: File) {
+    const currentSource = sourceRef.current;
+    if (!currentSource) return;
+    const base = {
+      ...EMPTY_TRANSCRIPT,
+      sourceUrl: currentSource.url,
+      origin: 'file' as const,
+      fileName: file.name,
+    };
+    try {
+      const cues = parseSubtitleFile(await file.text());
+      commitTranscript(
+        cues.length > 0
+          ? { ...base, status: 'ready', cues }
+          : { ...base, status: 'unavailable', message: `${file.name} has no readable captions.` },
+      );
+    } catch {
+      commitTranscript({ ...base, status: 'unavailable', message: `${file.name} could not be read.` });
+    }
+  }
+
+  // Speech since the last observation; resets to the last 30 s after a seek.
+  const takeNewSpeech = useCallback((now: number | null) => {
+    const { status, cues } = transcriptRef.current;
+    if (!followSpeechRef.current || status !== 'ready' || now === null) return undefined;
+    let from = speechCursorRef.current;
+    if (from === null || now < from - 1 || now - from > 180) from = Math.max(0, now - 30);
+    speechCursorRef.current = now;
+    const text = formatSpeech(cuesBetween(cues, from, now));
+    return text || undefined;
+  }, []);
 
   const changeStopAt = useCallback((text: string) => {
     const seconds = parseTimeInput(text);
@@ -1284,6 +1456,26 @@ export default function Home() {
         return { reason: mode === 'interval' ? 'interval' : 'key_moment', signal: null };
       }
 
+      // In Key moments mode, phrases like "as you can see" or "this slide" in the
+      // transcript trigger a look, since the speaker is pointing at something visual.
+      const { status: transcriptStatus, cues } = transcriptRef.current;
+      if (
+        mode === 'moments' &&
+        transcriptStatus === 'ready' &&
+        current.status === 'playing' &&
+        current.currentTime !== null
+      ) {
+        const now = current.currentTime;
+        const from = visualScanRef.current;
+        visualScanRef.current = now;
+        if (from !== null && now >= from - 1 && now - from <= 30) {
+          const hit = cuesBetween(cues, from, now).find((cue) => VISUAL_REFERENCE.test(cue.text));
+          if (hit && now - lastCaptureTimeRef.current >= SPEECH_TRIGGER_GAP_SECONDS) {
+            return { reason: 'key_moment', signal: null, trigger: `speech: "${hit.text}"` };
+          }
+        }
+      }
+
       if (events.length > 0) return { reason: 'playback_event', signal: null };
 
       if (
@@ -1343,6 +1535,18 @@ export default function Home() {
           ok: true,
           media: mediaMetadataRef.current,
           playback: publicPlaybackState(playbackRef.current),
+          transcript:
+            transcriptRef.current.status === 'ready'
+              ? {
+                  status: 'ready',
+                  ...transcriptProvenance(transcriptRef.current),
+                  lines: transcriptRef.current.cues.length,
+                  followSpeech: followSpeechRef.current,
+                }
+              : {
+                  status: transcriptRef.current.status,
+                  message: transcriptUnavailableMessage(transcriptRef.current),
+                },
           protocol: {
             ...WATCH_PROTOCOL,
             lookMode: lookModeRef.current,
@@ -1474,6 +1678,7 @@ export default function Home() {
           const capture = CAPTURE_WAKES.includes(wake.reason);
           if (capture && current.currentTime !== null) {
             cursor.nextCheckpointTime = current.currentTime + period;
+            lastCaptureTimeRef.current = current.currentTime;
           }
           const seq = ++observationSeqRef.current;
           const timecode = formatTimecode(current.currentTime);
@@ -1499,6 +1704,8 @@ export default function Home() {
           // accumulates in the conversation. The full protocol lives in
           // watch_get_session and the tool description, which are sent once.
           const signal = 'signal' in wake ? wake.signal : null;
+          const trigger = 'trigger' in wake ? wake.trigger : undefined;
+          const newSpeech = takeNewSpeech(finiteTime(current.currentTime ?? Number.NaN));
           if (signal?.markId) {
             // Tie the mark to the check-in that delivered it, even if the
             // agent later omits observationSeq.
@@ -1519,7 +1726,9 @@ export default function Home() {
               timecode,
               ...(signal?.emoji ? { signal: { emoji: signal.emoji, timecode: signal.timecode } } : {}),
               ...(signal?.markId ? { markId: signal.markId, markTimecode: signal.timecode } : {}),
+              ...(trigger ? { trigger } : {}),
               ...(events.length > 0 ? { events } : {}),
+              ...(newSpeech ? { newSpeech } : {}),
               ...(capture ? { captureTarget: playerCaptureTarget() } : {}),
               next: NEXT_STEP[wake.reason as WakeReason],
             },
@@ -1670,6 +1879,100 @@ export default function Home() {
         },
       },
       {
+        name: 'watch_get_transcript',
+        description:
+          'Read what was said around a moment, as timestamped paragraphs. Defaults to the last 90 seconds up to now. Use it to recover the spoken explanation instead of taking screenshots, or to answer "what did they just say?". Only read ahead of the current position (afterSeconds) when the viewer asks.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            beforeSeconds: { type: 'number', description: 'Seconds before the moment. Default 90.' },
+            afterSeconds: { type: 'number', description: 'Seconds after the moment. Default 0.' },
+            at: { type: 'string', description: 'Moment to center on, e.g. "00:12:30". Default now.' },
+          },
+          additionalProperties: false,
+        },
+        annotations: { readOnlyHint: true },
+        execute: async (input) => {
+          const current = transcriptRef.current;
+          if (current.status !== 'ready') {
+            return webMcpError('TRANSCRIPT_UNAVAILABLE', transcriptUnavailableMessage(current), playbackRef.current);
+          }
+          const options = (typeof input === 'object' && input !== null ? input : {}) as {
+            beforeSeconds?: unknown;
+            afterSeconds?: unknown;
+            at?: unknown;
+          };
+          const at =
+            typeof options.at === 'string' && options.at.trim()
+              ? parseTimeInput(options.at)
+              : (playbackRef.current.currentTime ?? 0);
+          if (at === null) {
+            return webMcpError('INVALID_OPTION', 'at must look like "00:12:30", "12:30", or "750".', playbackRef.current);
+          }
+          const clampSeconds = (value: unknown, fallback: number) =>
+            typeof value === 'number' && Number.isFinite(value)
+              ? Math.min(Math.max(value, 0), MAX_TRANSCRIPT_WINDOW_SECONDS)
+              : fallback;
+          const before = clampSeconds(options.beforeSeconds, 90);
+          const after = Math.min(clampSeconds(options.afterSeconds, 0), MAX_TRANSCRIPT_WINDOW_SECONDS - before);
+          const from = Math.max(0, at - before);
+          const to = at + after;
+          return {
+            ok: true,
+            transcript: transcriptProvenance(current),
+            fromTimecode: formatTimecode(from),
+            toTimecode: formatTimecode(to),
+            text: formatSpeech(cuesBetween(current.cues, from, to)) || '(no speech in this window)',
+          };
+        },
+      },
+      {
+        name: 'watch_search_transcript',
+        description:
+          'Find where words or a phrase were said, e.g. "when did they define an algorithm?". Returns up to 10 timestamped matches, only up to the current position unless includeAhead is true (use that only when the viewer asks).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string' },
+            includeAhead: { type: 'boolean' },
+          },
+          required: ['query'],
+          additionalProperties: false,
+        },
+        annotations: { readOnlyHint: true },
+        execute: async (input) => {
+          const current = transcriptRef.current;
+          if (current.status !== 'ready') {
+            return webMcpError('TRANSCRIPT_UNAVAILABLE', transcriptUnavailableMessage(current), playbackRef.current);
+          }
+          const options = (typeof input === 'object' && input !== null ? input : {}) as {
+            query?: unknown;
+            includeAhead?: unknown;
+          };
+          const query = typeof options.query === 'string' ? options.query.trim().toLowerCase() : '';
+          if (!query) {
+            return webMcpError('INVALID_OPTION', 'query is required.', playbackRef.current);
+          }
+          const limit =
+            options.includeAhead === true ? Infinity : (playbackRef.current.currentTime ?? 0) + 1;
+          const searchable = current.cues.filter((cue) => cue.start < limit);
+          const words = query.split(/\s+/);
+          let hits = searchable.filter((cue) => cue.text.toLowerCase().includes(query));
+          if (hits.length === 0) {
+            hits = searchable.filter((cue) => words.every((word) => cue.text.toLowerCase().includes(word)));
+          }
+          return {
+            ok: true,
+            transcript: transcriptProvenance(current),
+            matches: hits.slice(0, 10).map((cue) => ({
+              timecode: formatTimecode(cue.start),
+              text: cue.text,
+            })),
+            ...(hits.length > 10 ? { moreMatches: hits.length - 10 } : {}),
+          };
+        },
+      },
+      {
         name: 'watch_add_note',
         description:
           'Save a timestamped note in the viewer\'s notes panel. Use it when the viewer says "mark this", "note that…", or asks you to remember something, and to describe a moment the viewer marked (pass the observation\'s markId). If you are writing about an earlier moment, pass its timecode so the note points there; the page labels notes written well after their moment. Keep notes short and factual. This visibly changes the page and is saved.',
@@ -1771,6 +2074,9 @@ export default function Home() {
               ...(noteWrittenLateSeconds(note)
                 ? { writtenLaterSeconds: noteWrittenLateSeconds(note) }
                 : {}),
+              ...(note.excerpt
+                ? { spokenAround: note.excerpt.length > 200 ? `…${note.excerpt.slice(-199)}` : note.excerpt }
+                : {}),
             })),
         }),
       },
@@ -1860,6 +2166,7 @@ export default function Home() {
     createNote,
     publishVisualReactions,
     releaseObservation,
+    takeNewSpeech,
     waitForObservationWake,
   ]);
 
@@ -1962,6 +2269,9 @@ export default function Home() {
       setNotes(savedNotes);
       setNoteDraft('');
       setNotesMessage('');
+      clearTranscript();
+      // Loads in the background; playback and tools never wait on it.
+      if (parsedSource.kind === 'youtube') void loadYouTubeTranscript(parsedSource);
       setSource(parsedSource);
       setMediaMetadata(nextMetadata);
       mediaMetadataRef.current = nextMetadata;
@@ -1973,6 +2283,19 @@ export default function Home() {
     } catch (submissionError) {
       setError(submissionError instanceof Error ? submissionError.message : 'Unable to open this link.');
     }
+  }
+
+  function clearTranscript() {
+    transcriptRef.current = EMPTY_TRANSCRIPT;
+    setTranscript(EMPTY_TRANSCRIPT);
+    speechCursorRef.current = null;
+    visualScanRef.current = null;
+    lastCaptureTimeRef.current = -Infinity;
+  }
+
+  function changeFollowSpeech(enabled: boolean) {
+    followSpeechRef.current = enabled;
+    setFollowSpeech(enabled);
   }
 
   function reset() {
@@ -1989,6 +2312,7 @@ export default function Home() {
     sourceRef.current = null;
     notesRef.current = [];
     setNotes([]);
+    clearTranscript();
     changeStopAt('');
     setPlaybackStatus('idle');
     setReactions([]);
@@ -2296,6 +2620,60 @@ export default function Home() {
                 : ''}
             </p>
           ) : null}
+          {source.kind !== 'embed' ? (
+            <div className="transcript-bar">
+              <span>
+                {transcript.status === 'loading'
+                  ? 'Captions: loading…'
+                  : transcript.status === 'ready'
+                    ? transcript.origin === 'file'
+                      ? `Captions: ${transcript.fileName} · ${transcript.cues.length} lines`
+                      : `Captions: ${transcript.track?.name ?? transcript.track?.languageCode} · ${transcript.track?.kind} · ${transcript.cues.length} lines`
+                    : transcript.status === 'unavailable'
+                      ? `Captions unavailable: ${transcript.message}`
+                      : 'No captions loaded'}
+              </span>
+              {transcript.origin === 'youtube' && new Set(transcript.availableTracks.map((track) => track.languageCode)).size > 1 ? (
+                <select
+                  aria-label="Caption language"
+                  value={transcript.track?.languageCode ?? ''}
+                  onChange={(event) => {
+                    if (source.kind === 'youtube') void loadYouTubeTranscript(source, event.target.value);
+                  }}
+                >
+                  {[...new Map(transcript.availableTracks.map((track) => [track.languageCode, track])).values()].map(
+                    (track) => (
+                      <option key={track.languageCode} value={track.languageCode}>
+                        {track.name.replace(/ \(auto-generated\)$/, '')}
+                      </option>
+                    ),
+                  )}
+                </select>
+              ) : null}
+              {transcript.status === 'ready' ? (
+                <label className="follow-speech">
+                  <input
+                    type="checkbox"
+                    checked={followSpeech}
+                    onChange={(event) => changeFollowSpeech(event.target.checked)}
+                  />
+                  Send speech to GPT
+                </label>
+              ) : null}
+              <label className="transcript-file">
+                Load .srt/.vtt
+                <input
+                  type="file"
+                  accept=".srt,.vtt,text/vtt,application/x-subrip"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file) void loadTranscriptFile(file);
+                    event.target.value = '';
+                  }}
+                />
+              </label>
+            </div>
+          ) : null}
         </section>
 
         {notesOpen ? (
@@ -2347,6 +2725,11 @@ export default function Home() {
                               : ''}
                             {late ? ` · written ${late}s later` : ''}
                           </p>
+                          {note.excerpt ? (
+                            <blockquote className="note-excerpt" title={note.excerpt}>
+                              {note.excerpt}
+                            </blockquote>
+                          ) : null}
                         </div>
                         <button
                           type="button"
