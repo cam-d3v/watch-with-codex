@@ -688,6 +688,12 @@ h1 {
   overflow-wrap: anywhere;
 }
 
+.note[data-source='summary'] .note-text {
+  padding-left: 8px;
+  border-left: 2px solid #7c8cff;
+  color: var(--text-secondary);
+}
+
 .note-text[data-pending='true'] {
   color: var(--text-tertiary);
   font-style: italic;

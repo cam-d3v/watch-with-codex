@@ -53,6 +53,15 @@ const SEEK_SETTLE_SECONDS = 2.5;
 // Return a no-capture result this often. Must stay well under the agent
 // browser's tool-call timeout (about 20 s observed), or results get lost.
 const OBSERVER_HEARTBEAT_MS = 12_000;
+// Ask the agent for a rolling summary after this much newly watched playback.
+const SUMMARY_INTERVAL_SECONDS = 600;
+// Repeat an unanswered summary request at most this often.
+const SUMMARY_NUDGE_GAP_MS = 120_000;
+// Recap outline: one line per segment of this length, with its opening words.
+const OUTLINE_SEGMENT_SECONDS = 120;
+const OUTLINE_WORDS = 30;
+// Beyond this, a "full" recap falls back to the outline to bound tokens.
+const RECAP_FULL_MAX_CHARS = 60_000;
 // Observation results kept so ones the agent never received can be re-sent.
 const OBSERVATION_LOG_SIZE = 50;
 // End the loop if playback stays paused this long.
@@ -105,6 +114,8 @@ const WATCH_PROTOCOL = {
     'The page keeps timestamped notes beside the video. When the viewer says "mark this" or "note that…", call watch_add_note right away; if you write it after the moment has passed, pass the timecode of when they asked. When the viewer presses Mark, the observer returns mark_request with a markId: capture the frame and describe it with watch_add_note. Use watch_get_notes to recall earlier notes.',
   transcript:
     'When captions are available, each observation carries newSpeech: what was said since the previous observation, as timestamped paragraphs. Follow the explanation from newSpeech and use screenshots for what must be seen (slides, diagrams, code). Use watch_get_transcript to re-read a window and watch_search_transcript to find where something was said. Auto-generated captions can contain recognition errors; check the transcript source before quoting. Never reveal speech beyond the current position unless the viewer asks.',
+  recap:
+    'You keep the video\'s long-term memory as rolling summaries. When an observation carries summaryDue, write 2 to 4 factual sentences covering that range (from the speech, frames, and conversation) and save them with watch_save_summary, then keep observing. If you lose track of earlier parts of the video, start a new conversation on it, or the viewer asks what has been covered, call watch_get_recap.',
   statusCheck:
     'Use watch_get_status for a cheap check of playback state; do not re-read watch_get_session just to see whether the video is moving.',
   behavior: [
@@ -180,7 +191,9 @@ type Note = {
   writtenAt: number | null;
   text: string;
   // mark: the viewer pressed Mark and GPT is asked to describe the moment.
-  source: 'viewer' | 'gpt' | 'mark';
+  // summary: GPT's rolling summary of the section from time to endTime.
+  source: 'viewer' | 'gpt' | 'mark' | 'summary';
+  endTime?: number | null;
   // The check-in whose frame the note describes, and where playback was then.
   observationSeq: number | null;
   observationTime?: number | null;
@@ -401,6 +414,42 @@ function parseTimeInput(value: string): number | null {
   return hours * 3600 + minutes * 60 + seconds;
 }
 
+type TimeRange = { from: number; to: number };
+
+function mergeRanges(ranges: TimeRange[]) {
+  const merged: TimeRange[] = [];
+  for (const range of [...ranges].sort((a, b) => a.from - b.from)) {
+    const last = merged.at(-1);
+    if (last && range.from <= last.to + 3) last.to = Math.max(last.to, range.to);
+    else merged.push({ ...range });
+  }
+  return merged;
+}
+
+function watchedSecondsBetween(ranges: TimeRange[], from: number, to: number) {
+  return mergeRanges(ranges).reduce(
+    (total, range) => total + Math.max(0, Math.min(range.to, to) - Math.max(range.from, from)),
+    0,
+  );
+}
+
+// One line per segment: its start time and opening words. A cheap map of a
+// long stretch that the agent can drill into with watch_get_transcript.
+function transcriptOutline(cues: TranscriptCue[], from: number, to: number) {
+  const lines: string[] = [];
+  for (let start = from; start < to; start += OUTLINE_SEGMENT_SECONDS) {
+    const words = cuesBetween(cues, start, Math.min(start + OUTLINE_SEGMENT_SECONDS, to))
+      .map((cue) => cue.text)
+      .join(' ')
+      .split(/\s+/)
+      .filter(Boolean);
+    if (words.length === 0) continue;
+    const opening = words.slice(0, OUTLINE_WORDS).join(' ');
+    lines.push(`[${shortTimecode(start)}] ${opening}${words.length > OUTLINE_WORDS ? '…' : ''}`);
+  }
+  return lines.join('\n');
+}
+
 // Where the captions came from, so the agent can judge their reliability.
 function transcriptProvenance(transcript: TranscriptState) {
   if (transcript.origin === 'file') {
@@ -488,9 +537,18 @@ function loadStoredNotes(source: VideoSource): Note[] {
 }
 
 function noteWrittenLateSeconds(note: Note) {
-  if (note.time === null || note.writtenAt === null) return 0;
-  const late = note.writtenAt - note.time;
+  // A summary is late relative to the end of the section it covers.
+  const anchor = note.source === 'summary' ? (note.endTime ?? note.time) : note.time;
+  if (anchor === null || note.writtenAt === null) return 0;
+  const late = note.writtenAt - anchor;
   return late > NOTE_LATE_SECONDS ? Math.round(late) : 0;
+}
+
+function noteAuthorLabel(note: Note) {
+  if (note.source === 'viewer') return 'You';
+  if (note.source === 'summary') return `GPT summary to ${shortTimecode(note.endTime ?? null)}`;
+  if (note.source === 'mark') return note.text ? 'Your mark, described by GPT' : 'Your mark';
+  return 'GPT';
 }
 
 function noteLink(source: VideoSource, time: number | null) {
@@ -514,7 +572,13 @@ function notesToMarkdown(source: VideoSource, title: string | null, notes: Note[
     const link = noteLink(source, note.time);
     const late = noteWrittenLateSeconds(note);
     const by =
-      note.source === 'viewer' ? 'me' : note.source === 'mark' ? 'marked by me, described by GPT' : 'GPT';
+      note.source === 'viewer'
+        ? 'me'
+        : note.source === 'mark'
+          ? 'marked by me, described by GPT'
+          : note.source === 'summary'
+            ? `GPT summary, ${stamp} to ${shortTimecode(note.endTime ?? null)}`
+            : 'GPT';
     const details = [
       by,
       note.observationSeq !== null
@@ -970,6 +1034,9 @@ export default function Home() {
   // Playback time of the last observation that requested a capture.
   const lastCaptureTimeRef = useRef(-Infinity);
   const observationLogRef = useRef<ObservationRecord[]>([]);
+  // Playback ranges actually watched in this session, for recaps and summaries.
+  const watchedRangesRef = useRef<TimeRange[]>([]);
+  const lastSummaryNudgeAtRef = useRef(0);
   const [observerStatus, setObserverStatus] = useState<ObserverStatus>({
     waiting: false,
     endedAt: 0,
@@ -1035,11 +1102,15 @@ export default function Home() {
   }, []);
 
   const createNote = useCallback(
-    (fields: Pick<Note, 'text' | 'source'> & Partial<Pick<Note, 'time' | 'observationSeq'>>) => {
+    (
+      fields: Pick<Note, 'text' | 'source'> &
+        Partial<Pick<Note, 'time' | 'endTime' | 'observationSeq'>>,
+    ) => {
       const now = finiteTime(playbackRef.current.currentTime ?? Number.NaN);
       const note: Note = {
         id: `note-${Date.now()}-${noteSequenceRef.current++}`,
         time: fields.time === undefined ? now : fields.time,
+        ...(fields.endTime !== undefined ? { endTime: fields.endTime } : {}),
         writtenAt: fields.source === 'mark' ? null : now,
         text: fields.text.slice(0, MAX_NOTE_LENGTH),
         source: fields.source,
@@ -1051,7 +1122,8 @@ export default function Home() {
         createdAt: new Date().toISOString(),
       };
       const transcriptCues = transcriptRef.current.cues;
-      if (note.time !== null && transcriptCues.length > 0) {
+      // A summary spans a whole section, so a point excerpt would mislead.
+      if (note.time !== null && transcriptCues.length > 0 && note.source !== 'summary') {
         note.excerpt = excerptAround(transcriptCues, note.time) || undefined;
       }
       commitNotes([...notesRef.current, note]);
@@ -1059,6 +1131,16 @@ export default function Home() {
     },
     [commitNotes],
   );
+
+  // Where the next rolling summary should start: the end of the latest saved
+  // summary, else the start of what has been watched.
+  const lastSummaryEnd = useCallback(() => {
+    const ends = notesRef.current
+      .filter((note) => note.source === 'summary' && note.endTime != null)
+      .map((note) => note.endTime as number);
+    if (ends.length > 0) return Math.max(...ends);
+    return mergeRanges(watchedRangesRef.current)[0]?.from ?? 0;
+  }, []);
 
   const commitTranscript = useCallback(
     (next: TranscriptState) => {
@@ -1346,6 +1428,19 @@ export default function Home() {
         sampledAt,
         sourceUrl: current.sourceUrl,
       };
+
+      // Record which parts were actually watched; a jump starts a new range.
+      if (current.status === 'playing') {
+        const time = current.currentTime;
+        const ranges = watchedRangesRef.current;
+        const last = ranges.at(-1);
+        if (last && time >= last.to - 1 && time <= last.to + 3) {
+          last.to = Math.max(last.to, time);
+        } else {
+          ranges.push({ from: time, to: time });
+          if (ranges.length > 200) watchedRangesRef.current = mergeRanges(ranges);
+        }
+      }
     }
 
     const settled = settledStatusRef.current;
@@ -1776,6 +1871,28 @@ export default function Home() {
             missed.length > 0 ? MAX_TRANSCRIPT_WINDOW_SECONDS : undefined,
           );
           const newSpeech = speech.text;
+
+          // Ask for a rolling summary once enough new playback has been watched.
+          let summaryDue: { fromTimecode: string | null; toTimecode: string | null } | undefined;
+          const playbackTime = current.currentTime;
+          if (
+            playbackTime !== null &&
+            Date.now() - lastSummaryNudgeAtRef.current >= SUMMARY_NUDGE_GAP_MS
+          ) {
+            const summaryFrom = lastSummaryEnd();
+            if (
+              playbackTime > summaryFrom &&
+              watchedSecondsBetween(watchedRangesRef.current, summaryFrom, playbackTime) >=
+                SUMMARY_INTERVAL_SECONDS
+            ) {
+              lastSummaryNudgeAtRef.current = Date.now();
+              summaryDue = {
+                fromTimecode: formatTimecode(summaryFrom),
+                toTimecode: formatTimecode(playbackTime),
+              };
+            }
+          }
+
           observationLogRef.current = [
             ...observationLogRef.current.slice(-(OBSERVATION_LOG_SIZE - 1)),
             {
@@ -1824,6 +1941,7 @@ export default function Home() {
                 : {}),
               ...(events.length > 0 ? { events } : {}),
               ...(newSpeech ? { newSpeech } : {}),
+              ...(summaryDue ? { summaryDue } : {}),
               ...(capture ? { captureTarget: playerCaptureTarget() } : {}),
               next: NEXT_STEP[wake.reason as WakeReason],
             },
@@ -2068,6 +2186,119 @@ export default function Home() {
         },
       },
       {
+        name: 'watch_save_summary',
+        description:
+          'Save a rolling summary of a section of the video: 2 to 4 factual sentences on what was explained and shown, built from the speech and frames you received. Call it when an observation carries summaryDue (use its fromTimecode/toTimecode), or when the viewer asks you to summarize. Summaries are saved with the viewer\'s notes and returned by watch_get_recap, so later you (or a new conversation) can recover the video\'s context.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            text: { type: 'string' },
+            fromTimecode: { type: 'string', description: 'Section start. Defaults to the end of the last summary.' },
+            toTimecode: { type: 'string', description: 'Section end. Defaults to now.' },
+          },
+          required: ['text'],
+          additionalProperties: false,
+        },
+        execute: async (input) => {
+          if (!sourceRef.current) {
+            return webMcpError('NO_VIDEO', 'No video is open.', playbackRef.current);
+          }
+          const options = (typeof input === 'object' && input !== null ? input : {}) as {
+            text?: unknown;
+            fromTimecode?: unknown;
+            toTimecode?: unknown;
+          };
+          const text = typeof options.text === 'string' ? options.text.trim() : '';
+          if (!text) {
+            return webMcpError('INVALID_SUMMARY', 'text is required.', playbackRef.current);
+          }
+          const readTime = (value: unknown, fallback: number) =>
+            typeof value === 'string' && value.trim() ? parseTimeInput(value) : fallback;
+          const to = readTime(options.toTimecode, finiteTime(playbackRef.current.currentTime ?? 0) ?? 0);
+          const from = readTime(options.fromTimecode, lastSummaryEnd());
+          if (from === null || to === null || to <= from) {
+            return webMcpError(
+              'INVALID_SUMMARY',
+              'fromTimecode and toTimecode must be valid times with from before to.',
+              playbackRef.current,
+            );
+          }
+          const note = createNote({ text, source: 'summary', time: from, endTime: to });
+          return {
+            ok: true,
+            noteId: note.id,
+            fromTimecode: formatTimecode(from),
+            toTimecode: formatTimecode(to),
+          };
+        },
+      },
+      {
+        name: 'watch_get_recap',
+        description:
+          'Catch up on the video so far: which parts were watched this session, your saved rolling summaries, the viewer\'s notes, and an outline of the transcript since the last summary (detail "full" returns that stretch\'s full text instead). Call it when you have lost track of earlier parts of the video, after a long session or a new conversation, or when the viewer asks what has been covered.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            detail: { type: 'string', enum: ['outline', 'full'] },
+          },
+          additionalProperties: false,
+        },
+        annotations: { readOnlyHint: true },
+        execute: async (input) => {
+          const detail =
+            typeof input === 'object' && input !== null && (input as { detail?: unknown }).detail === 'full'
+              ? 'full'
+              : 'outline';
+          const now = playbackRef.current.currentTime ?? 0;
+          const from = lastSummaryEnd();
+          const current = transcriptRef.current;
+          const range = { fromTimecode: formatTimecode(from), toTimecode: formatTimecode(now) };
+
+          let sinceLastSummary: Record<string, unknown>;
+          if (current.status !== 'ready') {
+            sinceLastSummary = { ...range, message: transcriptUnavailableMessage(current) };
+          } else if (now <= from) {
+            sinceLastSummary = { ...range, message: 'Nothing new since the last summary.' };
+          } else {
+            const fullText =
+              detail === 'full' ? formatSpeech(cuesBetween(current.cues, from, now)) : '';
+            sinceLastSummary =
+              detail === 'full' && fullText.length <= RECAP_FULL_MAX_CHARS
+                ? { ...range, text: fullText || '(no speech)' }
+                : {
+                    ...range,
+                    outline: transcriptOutline(current.cues, from, now) || '(no speech)',
+                    ...(detail === 'full'
+                      ? { message: 'Too long for full text; showing the outline. Use watch_get_transcript for detail.' }
+                      : {}),
+                  };
+          }
+
+          const sortedNotes = [...notesRef.current].sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
+          return {
+            ok: true,
+            title: mediaMetadataRef.current?.title ?? null,
+            positionTimecode: formatTimecode(playbackRef.current.currentTime),
+            durationTimecode: formatTimecode(playbackRef.current.duration),
+            watchedThisSession: mergeRanges(watchedRangesRef.current)
+              .filter((watched) => watched.to - watched.from >= 1)
+              .map((watched) => `${shortTimecode(watched.from)}–${shortTimecode(watched.to)}`),
+            summaries: sortedNotes
+              .filter((note) => note.source === 'summary')
+              .map((note) => ({
+                fromTimecode: formatTimecode(note.time),
+                toTimecode: formatTimecode(note.endTime ?? null),
+                text: note.text,
+              })),
+            notes: sortedNotes
+              .filter((note) => note.source !== 'summary' && note.text)
+              .map((note) => ({ timecode: formatTimecode(note.time), by: note.source, text: note.text })),
+            sinceLastSummary,
+            ...(current.status === 'ready' ? { transcript: transcriptProvenance(current) } : {}),
+          };
+        },
+      },
+      {
         name: 'watch_add_note',
         description:
           'Save a timestamped note in the viewer\'s notes panel. Use it when the viewer says "mark this", "note that…", or asks you to remember something, and to describe a moment the viewer marked (pass the observation\'s markId). If you are writing about an earlier moment, pass its timecode so the note points there; the page labels notes written well after their moment. Keep notes short and factual. This visibly changes the page and is saved.',
@@ -2157,6 +2388,7 @@ export default function Home() {
             .map((note) => ({
               id: note.id,
               timecode: formatTimecode(note.time),
+              ...(note.source === 'summary' ? { endTimecode: formatTimecode(note.endTime ?? null) } : {}),
               text: note.text || null,
               by: note.source,
               ...(note.observationSeq !== null
@@ -2259,6 +2491,7 @@ export default function Home() {
     changeVideoOnly,
     commitNotes,
     createNote,
+    lastSummaryEnd,
     publishVisualReactions,
     releaseObservation,
     takeNewSpeech,
@@ -2318,6 +2551,8 @@ export default function Home() {
     timelineRef.current = [];
     settledStatusRef.current = null;
     pausedSinceRef.current = null;
+    watchedRangesRef.current = [];
+    lastSummaryNudgeAtRef.current = 0;
   }
 
   function submit(event: FormEvent<HTMLFormElement>) {
@@ -2832,8 +3067,7 @@ export default function Home() {
                               (note.source === 'mark' ? 'Marked. Waiting for GPT to describe it…' : '')}
                           </p>
                           <p className="note-meta">
-                            {note.source === 'viewer' ? 'You' : note.source === 'mark' ? 'Your mark' : 'GPT'}
-                            {note.source === 'mark' && note.text ? ', described by GPT' : ''}
+                            {noteAuthorLabel(note)}
                             {note.observationSeq !== null
                               ? ` · check #${note.observationSeq}${note.observationTime != null ? ` at ${shortTimecode(note.observationTime)}` : ''}`
                               : ''}
