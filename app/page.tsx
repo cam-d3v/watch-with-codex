@@ -50,8 +50,11 @@ const SPEECH_TRIGGER_GAP_SECONDS = 8;
 const MAX_TRANSCRIPT_WINDOW_SECONDS = 600;
 // Look this long after a seek lands, so the new frame has rendered.
 const SEEK_SETTLE_SECONDS = 2.5;
-// Return a no-capture result this often so a pending call never sits for minutes.
-const OBSERVER_HEARTBEAT_MS = 30_000;
+// Return a no-capture result this often. Must stay well under the agent
+// browser's tool-call timeout (about 20 s observed), or results get lost.
+const OBSERVER_HEARTBEAT_MS = 12_000;
+// Observation results kept so ones the agent never received can be re-sent.
+const OBSERVATION_LOG_SIZE = 50;
 // End the loop if playback stays paused this long.
 const PAUSE_LIMIT_MS = 10 * 60_000;
 const NOTES_KEY_PREFIX = 'watch-with-gpt:notes:';
@@ -71,14 +74,14 @@ const WAKE_LABELS: Record<WakeReason, string> = {
 // Capture wakes include captureTarget; "only" steers agents away from full-page screenshots.
 const NEXT_STEP: Record<WakeReason, string> = {
   look_request:
-    'The viewer asked you to look. Capture only captureTarget (not the full page), respond, then observe again.',
+    'The viewer asked you to look. Capture only captureTarget (not the full page), respond, then observe again with lastSeq = seq.',
   mark_request:
-    'The viewer marked this moment. Capture only captureTarget, call watch_add_note with markId, observationSeq and a one-line description, then observe again.',
-  user_signal: 'Capture only captureTarget, briefly acknowledge the emoji, then observe again.',
-  interval: 'Capture only captureTarget; comment only if worthwhile. Then observe again.',
-  key_moment: 'Capture only captureTarget; comment only if worthwhile. Then observe again.',
-  playback_event: 'No capture needed. Observe again.',
-  heartbeat: 'No capture needed. Observe again.',
+    'The viewer marked this moment. Capture only captureTarget, call watch_add_note with markId, observationSeq and a one-line description, then observe again with lastSeq = seq.',
+  user_signal: 'Capture only captureTarget, briefly acknowledge the emoji, then observe again with lastSeq = seq.',
+  interval: 'Capture only captureTarget; comment only if worthwhile. Then observe again with lastSeq = seq.',
+  key_moment: 'Capture only captureTarget; comment only if worthwhile. Then observe again with lastSeq = seq.',
+  playback_event: 'No capture needed. Observe again with lastSeq = seq.',
+  heartbeat: 'No capture needed. Observe again with lastSeq = seq.',
 };
 const CAPTURE_WAKES: readonly string[] = [
   'look_request',
@@ -244,6 +247,18 @@ type ObservationWake =
   | { reason: WakeReason; signal: UserSignal | null; trigger?: string }
   | { reason: 'cancelled' | 'ended' | 'stop_at' | 'paused_too_long' | 'session_changed' };
 
+// What an observation delivered, kept so it can be re-sent if the agent missed it.
+type ObservationRecord = {
+  seq: number;
+  sourceUrl: string;
+  wakeReason: WakeReason;
+  timecode: string | null;
+  speechFrom: number | null;
+  events: TimelineEvent[];
+  markId?: string;
+  emoji?: ReactionEmoji;
+};
+
 type ObserverStatus = {
   waiting: boolean;
   endedAt: number;
@@ -406,19 +421,34 @@ function transcriptUnavailableMessage(transcript: TranscriptState) {
   return transcript.message || 'No transcript is loaded for this video.';
 }
 
-// Where the video is on the page, so the agent can screenshot just the player.
+// Where the video is, so the agent can screenshot just the player. The clip is
+// relative to the visible viewport: a document-relative clip was misaligned by
+// the scroll offset in the agent's browser.
 function playerCaptureTarget() {
   const frame = document.querySelector('.player-frame');
   if (!frame) return { selector: '.player-frame' };
   const rect = frame.getBoundingClientRect();
+  // One pixel of slack for fractional layout sizes.
+  const fullyVisible =
+    rect.top >= -1 &&
+    rect.left >= -1 &&
+    rect.bottom <= window.innerHeight + 1 &&
+    rect.right <= window.innerWidth + 1;
   return {
     selector: '.player-frame',
     clip: {
-      x: Math.round(rect.left + window.scrollX),
-      y: Math.round(rect.top + window.scrollY),
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
       width: Math.round(rect.width),
       height: Math.round(rect.height),
     },
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    devicePixelRatio: Math.round(window.devicePixelRatio * 100) / 100,
+    // Scroll is irrelevant when Video only pins the player in place.
+    ...((window.scrollX || window.scrollY) && getComputedStyle(frame).position !== 'fixed'
+      ? { scroll: { x: Math.round(window.scrollX), y: Math.round(window.scrollY) } }
+      : {}),
+    ...(fullyVisible ? {} : { fullyVisible: false }),
   };
 }
 
@@ -929,6 +959,7 @@ export default function Home() {
   const observationSeqRef = useRef(0);
   // Playback time of the last observation that requested a capture.
   const lastCaptureTimeRef = useRef(-Infinity);
+  const observationLogRef = useRef<ObservationRecord[]>([]);
   const [observerStatus, setObserverStatus] = useState<ObserverStatus>({
     waiting: false,
     endedAt: 0,
@@ -1106,14 +1137,16 @@ export default function Home() {
   }
 
   // Speech since the last observation; resets to the last 30 s after a seek.
-  const takeNewSpeech = useCallback((now: number | null) => {
+  // Returns where the speech started so a lost result can be re-sent from there.
+  const takeNewSpeech = useCallback((now: number | null, maxGapSeconds = 180) => {
     const { status, cues } = transcriptRef.current;
-    if (!followSpeechRef.current || status !== 'ready' || now === null) return undefined;
+    if (!followSpeechRef.current || status !== 'ready' || now === null) {
+      return { from: null, text: undefined };
+    }
     let from = speechCursorRef.current;
-    if (from === null || now < from - 1 || now - from > 180) from = Math.max(0, now - 30);
+    if (from === null || now < from - 1 || now - from > maxGapSeconds) from = Math.max(0, now - 30);
     speechCursorRef.current = now;
-    const text = formatSpeech(cuesBetween(cues, from, now));
-    return text || undefined;
+    return { from, text: formatSpeech(cuesBetween(cues, from, now)) || undefined };
   }, []);
 
   const changeStopAt = useCallback((text: string) => {
@@ -1563,7 +1596,7 @@ export default function Home() {
             liveSignals:
               'A viewer emoji or Look now press wakes watch_observe_next_moment immediately with capture: true. It is intentional input inside the active watch-along, never an implicit request to pause or stop. Acknowledge it from the frame and conversation context, then continue observing in the same turn.',
             visualCapture:
-              'Capture only when observation.capture is true, or when the viewer asks you to look, in the same programmatic browser call that awaited the observer, with no model reasoning in between. Capture only the video: an element screenshot of captureTarget.selector (.player-frame), or a clip of captureTarget.clip (CSS pixels, page coordinates). Never capture the full page or viewport; it wastes tokens and includes unrelated UI. If your browser can only capture the viewport, call watch_configure with videoOnly: true first; the video then fills the window. The frame includes the video, captions, and player overlays.',
+              'Capture only when observation.capture is true, or when the viewer asks you to look, in the same programmatic browser call that awaited the observer, with no model reasoning in between. Capture only the video. Prefer an element screenshot of captureTarget.selector (.player-frame). Otherwise clip with captureTarget.clip: CSS pixels relative to the top-left of the visible viewport (not the document; scroll is already accounted for). If your screenshot is measured in device pixels, multiply the clip by captureTarget.devicePixelRatio. If a clipped image is misaligned or fullyVisible is false, call watch_configure with videoOnly: true: the player is then pinned to the viewport top-left at exactly 16:9, so the clip is x 0, y 0. Never capture the full page; it wastes tokens and includes unrelated UI. The frame includes the video, captions, and player overlays.',
             videoOnly: videoOnlyRef.current,
           },
         }),
@@ -1594,10 +1627,22 @@ export default function Home() {
       {
         name: 'watch_observe_next_moment',
         description:
-          'Continue an active watch-along. Run it inside one programmatic browser call: await this tool, and if observation.capture is true, capture the rendered .player-frame in the very next browser operation; return the observation (and image, if captured) together with no model reasoning in between. When capture is false, do not capture. The observer waits through pauses and wakes on the look-mode schedule, a viewer Look now request or emoji, play/pause/seek events (listed in observation.events), or a 30-second heartbeat. Use the frame and conversation to decide whether to stay quiet, react, or comment; always acknowledge a viewer emoji or look request. Keep calling it in the same turn until the user asks you to stop or it returns an error (ok: false). A new call safely replaces a pending one.',
-        inputSchema: noInputSchema,
+          'Continue an active watch-along. Run it inside one programmatic browser call: await this tool, and if observation.capture is true, capture the rendered .player-frame in the very next browser operation; return the observation (and image, if captured) together with no model reasoning in between. When capture is false, do not capture. The observer waits through pauses and wakes on the look-mode schedule, a viewer Look now request or emoji, play/pause/seek events (listed in observation.events), or a 12-second heartbeat. Always pass lastSeq, the seq of the last observation result you actually received (omit it only on the first call); if any results were lost, this call re-sends them in observation.missed and newSpeech restarts where you left off. Use the frame and conversation to decide whether to stay quiet, react, or comment; always acknowledge a viewer emoji or look request. Keep calling it in the same turn until the user asks you to stop or it returns an error (ok: false). A new call safely replaces a pending one.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            lastSeq: {
+              type: 'number',
+              description: 'seq of the last observation result you received.',
+            },
+          },
+          additionalProperties: false,
+        },
         annotations: { readOnlyHint: true },
-        execute: async () => {
+        execute: async (input) => {
+          const lastSeqInput =
+            typeof input === 'object' && input !== null ? (input as { lastSeq?: unknown }).lastSeq : undefined;
+          const lastSeq = typeof lastSeqInput === 'number' ? lastSeqInput : null;
           const initial = playbackRef.current;
           if (!initial.sourceUrl) {
             return webMcpError('NO_VIDEO', 'No video is open.', initial);
@@ -1705,7 +1750,35 @@ export default function Home() {
           // watch_get_session and the tool description, which are sent once.
           const signal = 'signal' in wake ? wake.signal : null;
           const trigger = 'trigger' in wake ? wake.trigger : undefined;
-          const newSpeech = takeNewSpeech(finiteTime(current.currentTime ?? Number.NaN));
+
+          // Results the agent says it never received (its lastSeq is behind):
+          // re-send what they carried and restart speech from the earliest one.
+          const missed =
+            lastSeq !== null
+              ? observationLogRef.current.filter(
+                  (record) => record.seq > lastSeq && record.sourceUrl === observedSource,
+                )
+              : [];
+          const missedSpeechFrom = missed.find((record) => record.speechFrom !== null)?.speechFrom;
+          if (missedSpeechFrom != null) speechCursorRef.current = missedSpeechFrom;
+          const speech = takeNewSpeech(
+            finiteTime(current.currentTime ?? Number.NaN),
+            missed.length > 0 ? MAX_TRANSCRIPT_WINDOW_SECONDS : undefined,
+          );
+          const newSpeech = speech.text;
+          observationLogRef.current = [
+            ...observationLogRef.current.slice(-(OBSERVATION_LOG_SIZE - 1)),
+            {
+              seq,
+              sourceUrl: observedSource,
+              wakeReason: wake.reason as WakeReason,
+              timecode,
+              speechFrom: speech.from,
+              events,
+              ...(signal?.markId ? { markId: signal.markId } : {}),
+              ...(signal?.emoji ? { emoji: signal.emoji } : {}),
+            },
+          ];
           if (signal?.markId) {
             // Tie the mark to the check-in that delivered it, even if the
             // agent later omits observationSeq.
@@ -1727,6 +1800,18 @@ export default function Home() {
               ...(signal?.emoji ? { signal: { emoji: signal.emoji, timecode: signal.timecode } } : {}),
               ...(signal?.markId ? { markId: signal.markId, markTimecode: signal.timecode } : {}),
               ...(trigger ? { trigger } : {}),
+              ...(missed.length > 0
+                ? {
+                    missed: missed.map((record) => ({
+                      seq: record.seq,
+                      wakeReason: record.wakeReason,
+                      timecode: record.timecode,
+                      ...(record.markId ? { markId: record.markId } : {}),
+                      ...(record.emoji ? { emoji: record.emoji } : {}),
+                      ...(record.events.length > 0 ? { events: record.events } : {}),
+                    })),
+                  }
+                : {}),
               ...(events.length > 0 ? { events } : {}),
               ...(newSpeech ? { newSpeech } : {}),
               ...(capture ? { captureTarget: playerCaptureTarget() } : {}),

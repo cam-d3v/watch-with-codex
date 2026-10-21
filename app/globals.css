@@ -509,14 +509,27 @@ h1 {
   }
 }
 
-/* Video only: the player covers the window so any screenshot is just the video. */
+/* Video only: the player is pinned to the viewport's top-left at exact 16:9, so
+   a clip of (0, 0, width, height) is the video regardless of scroll or layout. */
+:root:has(.watch-screen[data-video-only='true']) {
+  overflow: hidden;
+}
+
+.watch-screen[data-video-only='true']::before {
+  position: fixed;
+  z-index: 19;
+  inset: 0;
+  background: #000000;
+  content: '';
+}
+
 .watch-screen[data-video-only='true'] .player-frame {
   position: fixed;
   z-index: 20;
-  inset: 0;
-  width: 100vw;
-  height: 100dvh;
-  aspect-ratio: auto;
+  top: 0;
+  left: 0;
+  width: min(100vw, calc(100dvh * 16 / 9));
+  aspect-ratio: 16 / 9;
   border: 0;
   border-radius: 0;
   box-shadow: none;
