@@ -392,6 +392,34 @@ h1 {
   color: var(--text);
 }
 
+.stop-at {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.stop-at input {
+  width: 76px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+}
+
+.stop-at input:focus-visible {
+  outline: 0;
+  border-color: var(--border-strong);
+}
+
+.stop-at input[aria-invalid='true'] {
+  border-color: #e5484d;
+}
+
 .player-note {
   min-height: 18px;
   margin: 10px 0 0;

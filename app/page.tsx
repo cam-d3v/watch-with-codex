@@ -63,8 +63,8 @@ type PlaybackStatus =
   | 'unavailable';
 
 type VideoSource =
-  | { kind: 'youtube'; url: string; videoId: string }
-  | { kind: 'direct'; url: string }
+  | { kind: 'youtube'; url: string; videoId: string; startSeconds: number | null }
+  | { kind: 'direct'; url: string; startSeconds: number | null }
   | { kind: 'embed'; url: string };
 
 type MediaMetadata = {
@@ -207,10 +207,6 @@ function finiteTime(value: number) {
   return Number.isFinite(value) && value >= 0 ? Math.round(value * 10) / 10 : null;
 }
 
-function finiteDelta(value: number) {
-  return Number.isFinite(value) ? Math.round(value * 10) / 10 : null;
-}
-
 function formatTimecode(value: number | null) {
   if (value === null || !Number.isFinite(value) || value < 0) return null;
 
@@ -223,6 +219,21 @@ function formatTimecode(value: number | null) {
   const hours = Math.floor(totalMinutes / 60);
 
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${tenths}`;
+}
+
+// Accepts "3600", "3600s", "1h2m3s" (YouTube's t= format), or clock style "1:02:03".
+function parseTimeInput(value: string): number | null {
+  const text = value.trim().toLowerCase();
+  if (!text) return null;
+
+  if (/^\d+(:\d{1,2}){0,2}$/.test(text)) {
+    return text.split(':').reduce((total, part) => total * 60 + Number(part), 0);
+  }
+
+  const units = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?$/.exec(text);
+  if (!units || !units.slice(1).some(Boolean)) return null;
+  const [hours, minutes, seconds] = units.slice(1).map((part) => Number(part ?? 0));
+  return hours * 3600 + minutes * 60 + seconds;
 }
 
 function publicPlaybackState(snapshot: PlaybackSnapshot) {
@@ -314,6 +325,11 @@ function parseVideoSource(value: string): VideoSource {
   }
 
   const hostname = url.hostname.toLowerCase();
+  const startParam =
+    url.searchParams.get('t') ??
+    url.searchParams.get('start') ??
+    new URLSearchParams(url.hash.slice(1)).get('t');
+  const startSeconds = startParam ? parseTimeInput(startParam) : null;
   const isYouTube =
     hostname === 'youtu.be' ||
     hostname === 'youtube.com' ||
@@ -333,11 +349,11 @@ function parseVideoSource(value: string): VideoSource {
       throw new Error('This YouTube link does not contain a valid video ID.');
     }
 
-    return { kind: 'youtube', url: url.toString(), videoId };
+    return { kind: 'youtube', url: url.toString(), videoId, startSeconds };
   }
 
   if (/\.(mp4|webm|ogg|ogv|m4v|mov)$/i.test(url.pathname)) {
-    return { kind: 'direct', url: url.toString() };
+    return { kind: 'direct', url: url.toString(), startSeconds };
   }
 
   return { kind: 'embed', url: url.toString() };
@@ -437,6 +453,7 @@ function YouTubeSurface({
             playsinline: 1,
             rel: 0,
             origin: window.location.origin,
+            ...(source.startSeconds ? { start: Math.floor(source.startSeconds) } : {}),
           },
           events: {
             onReady: (event) => {
@@ -473,7 +490,7 @@ function YouTubeSurface({
       if (intervalId !== null) window.clearInterval(intervalId);
       player?.destroy();
     };
-  }, [controllerRef, onPlayback, source.videoId]);
+  }, [controllerRef, onPlayback, source.startSeconds, source.videoId]);
 
   return <div className="youtube-host" ref={hostRef} />;
 }
@@ -540,6 +557,10 @@ function DirectVideoSurface({
       controls
       playsInline
       preload="metadata"
+      onLoadedMetadata={(event) => {
+        if (source.startSeconds) event.currentTarget.currentTime = source.startSeconds;
+        report();
+      }}
       onCanPlay={report}
       onDurationChange={report}
       onEnded={report}
@@ -628,6 +649,20 @@ export default function Home() {
   const reactionMenuRef = useRef<HTMLDivElement>(null);
   const lastViewerReactionAtRef = useRef(0);
   const viewerReactionCooldownTimerRef = useRef<number | null>(null);
+  const [stopAtText, setStopAtText] = useState('');
+  const [stopAtSeconds, setStopAtSeconds] = useState<number | null>(null);
+  const stopAtRef = useRef<number | null>(null);
+  const sourceStartRef = useRef<number | null>(null);
+  // Armed while playback is before the stop time, so resuming past it is not re-paused.
+  const stopArmedRef = useRef(false);
+
+  function changeStopAt(text: string) {
+    const seconds = parseTimeInput(text);
+    setStopAtText(text);
+    setStopAtSeconds(seconds);
+    stopAtRef.current = seconds;
+    stopArmedRef.current = false;
+  }
 
   useEffect(() => {
     mediaMetadataRef.current = mediaMetadata;
@@ -744,6 +779,20 @@ export default function Home() {
         sampledAt,
         sourceUrl: current.sourceUrl,
       };
+    }
+
+    const stopAt = stopAtRef.current;
+    if (stopAt !== null && current.currentTime !== null) {
+      if (current.currentTime < stopAt - 1) {
+        stopArmedRef.current = true;
+      } else if (
+        stopArmedRef.current &&
+        current.status === 'playing' &&
+        current.currentTime >= stopAt
+      ) {
+        stopArmedRef.current = false;
+        void controllerRef.current?.pause();
+      }
     }
 
     playbackRef.current = current;
@@ -910,8 +959,12 @@ export default function Home() {
             observationIntervalBasis: 'video playback time',
             viewerReactionCooldownSeconds: VIEWER_REACTION_COOLDOWN_MS / 1_000,
             maxAgentReactionsPerCall: MAX_AGENT_REACTIONS,
+            startTimecode: formatTimecode(sourceStartRef.current ?? Number.NaN),
+            stopAtTimecode: formatTimecode(stopAtRef.current ?? Number.NaN),
+            stopAt:
+              'When stopAtTimecode is set, the page pauses playback there and the observer returns STOP_AT_REACHED; end the loop and tell the viewer.',
             mediaMetadata:
-              'watch_get_session returns session-level media identity once. Observations repeat only mediaSessionId and sourceId alongside timing fields.',
+              'watch_get_session returns session-level media identity once. Observations are compact: wake reason, timecodes, and a short "next" reminder. If the video changes, the observer returns SESSION_CHANGED.',
             liveSignals:
               'Any viewer emoji wakes watch_observe_next_moment immediately. It is intentional input inside the active watch-along, never an implicit request to pause or stop. Acknowledge it from the returned emoji, visible frame, and conversation context, then continue observing in the same turn while playback remains active.',
             visualCapture:
@@ -995,6 +1048,14 @@ export default function Home() {
             );
           }
           if (current.status !== 'playing') {
+            const stopAt = stopAtRef.current;
+            if (stopAt !== null && (current.currentTime ?? 0) >= stopAt - 1) {
+              return webMcpError(
+                'STOP_AT_REACHED',
+                `Paused at the viewer's stop-at time (${formatTimecode(stopAt)}). Stop the observation loop and let the viewer know.`,
+                current,
+              );
+            }
             return webMcpError(
               'PLAYBACK_STOPPED',
               'Playback paused or ended. Stop the observation loop.',
@@ -1015,8 +1076,6 @@ export default function Home() {
           const seekDetected =
             currentDiscontinuitySequence !== cursor.discontinuitySequence ||
             currentPlaybackTime < cursor.previousPlaybackTime - 1;
-          const elapsedPlaybackSeconds =
-            finiteDelta(currentPlaybackTime - cursor.previousPlaybackTime);
           const crossedCheckpointCount =
             seekDetected || currentPlaybackTime < cursor.nextCheckpointTime
               ? 0
@@ -1035,51 +1094,28 @@ export default function Home() {
             discontinuitySequence: currentDiscontinuitySequence,
           };
 
-          const observationId = `observation-${Date.now()}`;
-          const capturedAt = new Date().toISOString();
+          // Kept deliberately small: this payload repeats at every checkpoint and
+          // accumulates in the conversation. The full protocol lives in
+          // watch_get_session and the tool description, which are sent once.
+          const missedCheckpoints = Math.max(0, crossedCheckpointCount - 1);
+          const stopAt = stopAtRef.current;
 
           return {
             ok: true,
             observation: {
-              id: observationId,
-              capturedAt,
               wakeReason: wake.reason,
-              signal: wake.reason === 'user_signal' ? wake.signal : null,
-              observationIntervalSeconds: intervalSeconds,
-              observationIntervalBasis: 'video playback time',
-              previousPlaybackTime: cursor.previousPlaybackTime,
+              ...(wake.reason === 'user_signal'
+                ? { signal: { emoji: wake.signal.emoji, timecode: wake.signal.timecode } }
+                : {}),
+              timecode: formatTimecode(currentPlaybackTime),
               previousTimecode: formatTimecode(cursor.previousPlaybackTime),
-              elapsedPlaybackSeconds,
-              seekDetected,
-              cursor: {
-                crossedCheckpointCount,
-                missedCheckpointCount: Math.max(0, crossedCheckpointCount - 1),
-                nextCheckpointPlaybackTime: finiteTime(nextCheckpointTime),
-                nextCheckpointTimecode: formatTimecode(nextCheckpointTime),
-              },
-              mediaSessionId: mediaMetadataRef.current?.sessionId ?? null,
-              sourceId: mediaMetadataRef.current?.sourceId ?? null,
-              playback: publicPlaybackState(current),
-              visualCapture: {
-                source: 'browser page observation',
-                targetSelector: '.player-frame',
-                includes: ['video', 'captions', 'player overlays'],
-                requiredBeforeReasoning: true,
-                orchestration: 'same programmatic browser call',
-                returnWithObservation: true,
-                interveningModelTurns: 0,
-                sequence: [
-                  'await watch_observe_next_moment',
-                  'capture .player-frame in the next browser operation',
-                  'return the structured observation and image together',
-                ],
-              },
-              visualInstruction:
-                'This observation is incomplete without its paired frame. The same browser program that awaited this result must capture the rendered .player-frame in its very next operation and return the structured observation and image together. Do not yield to model reasoning between this result and the capture. Only then use the frame, wake reason, optional user signal, and conversation context to decide whether to stay quiet, react, or respond.',
-              continuationInstruction:
+              ...(seekDetected ? { seekDetected: true } : {}),
+              ...(missedCheckpoints > 0 ? { missedCheckpoints } : {}),
+              ...(stopAt !== null ? { stopAtTimecode: formatTimecode(stopAt) } : {}),
+              next:
                 wake.reason === 'user_signal'
-                  ? 'This viewer signal is part of the ongoing watch-along, not a stop or pause request. After the paired frame is captured, acknowledge the signal in context, keep playback running, and immediately repeat the same one-program observe-and-capture operation in this turn. Stop only if the user explicitly asks you to stop watching or playback is no longer active.'
-                  : 'If the user still wants active watching and playback remains active, immediately repeat the same one-program observe-and-capture operation in this turn. Stop only if the user asks you to stop watching or playback is no longer active.',
+                  ? 'Capture .player-frame now, acknowledge the emoji, keep playing, observe again.'
+                  : 'Capture .player-frame now, then observe again unless the user asked to stop.',
             },
           };
         },
@@ -1232,6 +1268,8 @@ export default function Home() {
       playbackSampleRef.current = null;
       playbackDiscontinuitySequenceRef.current = 0;
       observationCursorRef.current = null;
+      sourceStartRef.current = parsedSource.kind === 'embed' ? null : parsedSource.startSeconds;
+      changeStopAt('');
       setSource(parsedSource);
       setMediaMetadata(nextMetadata);
       mediaMetadataRef.current = nextMetadata;
@@ -1256,6 +1294,8 @@ export default function Home() {
     playbackSampleRef.current = null;
     playbackDiscontinuitySequenceRef.current = 0;
     observationCursorRef.current = null;
+    sourceStartRef.current = null;
+    changeStopAt('');
     setPlaybackStatus('idle');
     setReactions([]);
     setReactionMenuOpen(false);
@@ -1415,6 +1455,20 @@ export default function Home() {
               </button>
             ))}
           </div>
+
+          {source.kind !== 'embed' ? (
+            <label className="stop-at">
+              <span>Stop at</span>
+              <input
+                type="text"
+                value={stopAtText}
+                onChange={(event) => changeStopAt(event.target.value)}
+                placeholder="h:mm:ss"
+                aria-invalid={Boolean(stopAtText.trim()) && stopAtSeconds === null}
+                title="Pause automatically at this time, e.g. 1:00:00 or 45m"
+              />
+            </label>
+          ) : null}
         </div>
 
         {source.kind === 'embed' ? (
@@ -1424,6 +1478,8 @@ export default function Home() {
         ) : (
           <p className="player-note" data-playback-status={playbackStatus}>
             {playbackStatus === 'playing' ? 'Playing together' : 'Ready when you are'}
+            {source.startSeconds ? ` · starts at ${formatTimecode(source.startSeconds)?.slice(0, -2)}` : ''}
+            {stopAtSeconds !== null ? ` · pauses at ${formatTimecode(stopAtSeconds)?.slice(0, -2)}` : ''}
           </p>
         )}
       </section>
