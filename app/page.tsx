@@ -32,13 +32,24 @@ const OBSERVATION_INTERVALS_SECONDS = [5, 10, 15] as const;
 const DEFAULT_OBSERVATION_INTERVAL_SECONDS = 5;
 const VIEWER_REACTION_COOLDOWN_MS = 3_000;
 const MAX_AGENT_REACTIONS = 5;
+const DEFAULT_LOOK_MODE = 'moments';
+const KEY_MOMENT_FALLBACK_SECONDS = 60;
+// Look this long after a seek lands, so the new frame has rendered.
+const SEEK_SETTLE_SECONDS = 2.5;
+// Return a no-capture result this often so a pending call never sits for minutes.
+const OBSERVER_HEARTBEAT_MS = 30_000;
+// End the loop if playback stays paused this long.
+const PAUSE_LIMIT_MS = 10 * 60_000;
+const CAPTURE_WAKES: readonly string[] = ['look_request', 'user_signal', 'interval', 'key_moment'];
 
 const WATCH_PROTOCOL = {
   role: 'Share the open video with the user as a natural viewing companion.',
   userIntent:
     'The user decides what kind of company they want. Follow their current request; watching together does not require a fixed amount of commentary or reactions.',
   observation:
-    'When the user asks you to actively watch, run every observation as one programmatic browser call: preselect the rendered .player-frame, await watch_observe_next_moment, capture that frame in the very next browser operation, and return the structured observation and image to the model together. Never yield to model reasoning between the WebMCP result and frame capture, and never invoke the observer as a standalone call during active watching. Repeat this paired operation in the same turn. Each observer resolves when the configured observation interval elapses or immediately when the user sends a live signal. A live signal interrupts the wait, not the watch-along: handle it and immediately continue observing while playback is active. Stop only when the user asks you to stop watching or playback pauses, ends, or becomes unavailable.',
+    'When the user asks you to watch, run each observation as one programmatic browser call: await watch_observe_next_moment and, only if observation.capture is true, capture the rendered .player-frame in the very next browser operation; return the observation (and image, if captured) together. Never yield to model reasoning between the WebMCP result and the capture. Repeat in the same turn. The observer follows play, pause, and seek and keeps waiting while paused, so a pause does not end the watch-along. It wakes on the look mode schedule, when the viewer presses Look now or sends an emoji, on playback events, and on a short heartbeat. If the viewer asks out loud to look at something, capture .player-frame right away, answer, then resume observing. Stop only when the user asks or the observer returns an error.',
+  lookModes:
+    'request: capture only when the viewer asks (Look now, emoji, or voice). moments: capture shortly after seeks and periodically as a fallback. interval: capture every few seconds of playback. The viewer can change this on the page, or you can change it with watch_configure when they ask.',
   behavior: [
     'Stay quiet by default.',
     'Do not comment on every observation.',
@@ -97,19 +108,37 @@ type PlayerController = {
 type ReactionEmoji = (typeof REACTION_EMOJIS)[number];
 type ObservationIntervalSeconds = (typeof OBSERVATION_INTERVALS_SECONDS)[number];
 
+// request: look only when the viewer asks (button, emoji, or voice).
+// moments: look shortly after seeks, plus a fallback every KEY_MOMENT_FALLBACK_SECONDS.
+// interval: look every 5/10/15 seconds of playback.
+type LookMode = 'request' | 'moments' | 'interval';
+
 type UserSignal = {
   id: string;
-  kind: 'emoji';
-  emoji: ReactionEmoji;
+  kind: 'emoji' | 'look';
+  emoji: ReactionEmoji | null;
   createdAt: string;
   playbackTime: number | null;
   timecode: string | null;
 };
 
+type TimelineEvent = {
+  type: 'started' | 'paused' | 'resumed' | 'seeked' | 'ended' | 'stop_at';
+  timecode: string | null;
+  fromTimecode?: string | null;
+};
+
+type WakeReason =
+  | 'look_request'
+  | 'user_signal'
+  | 'interval'
+  | 'key_moment'
+  | 'playback_event'
+  | 'heartbeat';
+
 type ObservationWake =
-  | { reason: 'interval' }
-  | { reason: 'user_signal'; signal: UserSignal }
-  | { reason: 'cancelled' };
+  | { reason: WakeReason; signal: UserSignal | null }
+  | { reason: 'cancelled' | 'ended' | 'stop_at' | 'paused_too_long' | 'session_changed' };
 
 type ObservationWaiter = {
   timerId: number;
@@ -118,10 +147,7 @@ type ObservationWaiter = {
 
 type ObservationCursor = {
   sourceUrl: string;
-  intervalSeconds: ObservationIntervalSeconds;
-  previousPlaybackTime: number;
-  nextCheckpointTime: number;
-  discontinuitySequence: number;
+  nextCheckpointTime: number | null;
 };
 
 type PlaybackSample = {
@@ -201,6 +227,19 @@ let youtubeApiPromise: Promise<YouTubeNamespace> | null = null;
 
 function wait(milliseconds: number) {
   return new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function waitForStatus(
+  playbackRef: MutableRefObject<PlaybackSnapshot>,
+  statuses: PlaybackStatus[],
+  timeoutMs: number,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (statuses.includes(playbackRef.current.status)) return true;
+    await wait(100);
+  }
+  return statuses.includes(playbackRef.current.status);
 }
 
 function finiteTime(value: number) {
@@ -645,7 +684,6 @@ export default function Home() {
   const observationWaiterRef = useRef<ObservationWaiter | null>(null);
   const observationCursorRef = useRef<ObservationCursor | null>(null);
   const playbackSampleRef = useRef<PlaybackSample | null>(null);
-  const playbackDiscontinuitySequenceRef = useRef(0);
   const reactionMenuRef = useRef<HTMLDivElement>(null);
   const lastViewerReactionAtRef = useRef(0);
   const viewerReactionCooldownTimerRef = useRef<number | null>(null);
@@ -655,14 +693,44 @@ export default function Home() {
   const sourceStartRef = useRef<number | null>(null);
   // Armed while playback is before the stop time, so resuming past it is not re-paused.
   const stopArmedRef = useRef(false);
+  const [plannedStartText, setPlannedStartText] = useState('');
+  const [plannedStopText, setPlannedStopText] = useState('');
+  const [lookMode, setLookMode] = useState<LookMode>(DEFAULT_LOOK_MODE);
+  const lookModeRef = useRef<LookMode>(DEFAULT_LOOK_MODE);
+  // Play/pause/seek events not yet reported to the agent.
+  const timelineRef = useRef<TimelineEvent[]>([]);
+  // Last settled status (playing, paused, ended), ignoring buffering blips.
+  const settledStatusRef = useRef<PlaybackStatus | null>(null);
+  const pausedSinceRef = useRef<number | null>(null);
+  // When the current run of observer calls began; a gap of over a minute starts a new run.
+  const loopStartedAtRef = useRef(0);
+  const lastObserveAtRef = useRef(0);
 
-  function changeStopAt(text: string) {
+  const changeStopAt = useCallback((text: string) => {
     const seconds = parseTimeInput(text);
     setStopAtText(text);
     setStopAtSeconds(seconds);
     stopAtRef.current = seconds;
     stopArmedRef.current = false;
-  }
+  }, []);
+
+  const changeLookMode = useCallback(
+    (mode: LookMode, intervalSeconds?: ObservationIntervalSeconds) => {
+      setLookMode(mode);
+      lookModeRef.current = mode;
+      if (intervalSeconds) {
+        setObservationIntervalSeconds(intervalSeconds);
+        observationIntervalRef.current = intervalSeconds;
+      }
+      // Restart the schedule from the current position under the new mode.
+      if (observationCursorRef.current) observationCursorRef.current.nextCheckpointTime = null;
+    },
+    [],
+  );
+
+  const pushTimeline = useCallback((event: TimelineEvent) => {
+    timelineRef.current = [...timelineRef.current.slice(-19), event];
+  }, []);
 
   useEffect(() => {
     mediaMetadataRef.current = mediaMetadata;
@@ -760,17 +828,28 @@ export default function Home() {
 
     if (current.currentTime !== null) {
       const previousSample = playbackSampleRef.current;
+      // Before first play, the player jumping to a start time is not a seek.
       if (
         previousSample &&
         previousSample.sourceUrl === current.sourceUrl &&
-        previous.status === 'playing' &&
-        current.status === 'playing'
+        settledStatusRef.current !== null
       ) {
         const wallDeltaSeconds = Math.max(0, (sampledAt - previousSample.sampledAt) / 1_000);
         const mediaDeltaSeconds = current.currentTime - previousSample.mediaTime;
-        const largestExpectedAdvance = Math.max(2, wallDeltaSeconds * 4 + 1);
+        // Playing media advances with the clock (allowing fast playback rates);
+        // otherwise it should barely move, so any jump is a seek.
+        const largestExpectedAdvance =
+          previous.status === 'playing' ? Math.max(2, wallDeltaSeconds * 4 + 1) : 1.5;
         if (mediaDeltaSeconds < -1 || mediaDeltaSeconds > largestExpectedAdvance) {
-          playbackDiscontinuitySequenceRef.current += 1;
+          pushTimeline({
+            type: 'seeked',
+            fromTimecode: formatTimecode(previousSample.mediaTime),
+            timecode: formatTimecode(current.currentTime),
+          });
+          if (observationCursorRef.current && lookModeRef.current !== 'request') {
+            observationCursorRef.current.nextCheckpointTime =
+              current.currentTime + SEEK_SETTLE_SECONDS;
+          }
         }
       }
 
@@ -779,6 +858,25 @@ export default function Home() {
         sampledAt,
         sourceUrl: current.sourceUrl,
       };
+    }
+
+    const settled = settledStatusRef.current;
+    if (
+      (current.status === 'playing' || current.status === 'paused' || current.status === 'ended') &&
+      current.status !== settled
+    ) {
+      const timecode = formatTimecode(current.currentTime);
+      if (current.status === 'playing') {
+        pushTimeline({ type: settled === null ? 'started' : 'resumed', timecode });
+      } else {
+        pushTimeline({ type: current.status, timecode });
+      }
+      settledStatusRef.current = current.status;
+    }
+    if (current.status === 'playing') {
+      pausedSinceRef.current = null;
+    } else if (pausedSinceRef.current === null) {
+      pausedSinceRef.current = Date.now();
     }
 
     const stopAt = stopAtRef.current;
@@ -791,6 +889,7 @@ export default function Home() {
         current.currentTime >= stopAt
       ) {
         stopArmedRef.current = false;
+        pushTimeline({ type: 'stop_at', timecode: formatTimecode(stopAt) });
         void controllerRef.current?.pause();
       }
     }
@@ -799,7 +898,7 @@ export default function Home() {
     if (current.status !== previous.status) {
       setPlaybackStatus(current.status);
     }
-  }, []);
+  }, [pushTimeline]);
 
   const publishVisualReactions = useCallback(
     (emojis: readonly ReactionEmoji[], eventSource: 'user' | 'agent') => {
@@ -842,18 +941,23 @@ export default function Home() {
   }, []);
 
   const publishUserSignal = useCallback(
-    (emoji: ReactionEmoji) => {
+    (kind: UserSignal['kind'], emoji: ReactionEmoji | null = null) => {
       const playbackTime = finiteTime(playbackRef.current.currentTime ?? Number.NaN);
       const signal: UserSignal = {
         id: `signal-${Date.now()}-${signalSequenceRef.current++}`,
-        kind: 'emoji',
+        kind,
         emoji,
         createdAt: new Date().toISOString(),
         playbackTime,
         timecode: formatTimecode(playbackTime),
       };
 
-      if (!releaseObservation({ reason: 'user_signal', signal })) {
+      if (
+        !releaseObservation({
+          reason: kind === 'look' ? 'look_request' : 'user_signal',
+          signal,
+        })
+      ) {
         pendingSignalsRef.current = [...pendingSignalsRef.current.slice(-19), signal];
       }
     },
@@ -876,58 +980,78 @@ export default function Home() {
       }, VIEWER_REACTION_COOLDOWN_MS);
 
       publishVisualReactions([emoji], 'user');
-      publishUserSignal(emoji);
+      publishUserSignal('emoji', emoji);
     },
     [publishUserSignal, publishVisualReactions],
   );
 
-  const waitForObservationWake = useCallback(
-    (startPlaybackTime: number, targetPlaybackTime: number) => {
+  // Polls page state every 100 ms and resolves on the first reason to wake the agent.
+  // Signals that arrive while no call is pending are queued and returned at once.
+  const waitForObservationWake = useCallback((observedSource: string) => {
+    const startedAt = Date.now();
+
+    const nextWake = (): ObservationWake | null => {
+      const current = playbackRef.current;
+      if (current.sourceUrl !== observedSource) return { reason: 'session_changed' };
+
       const queuedSignal = pendingSignalsRef.current.shift();
       if (queuedSignal) {
-        return Promise.resolve<ObservationWake>({
-          reason: 'user_signal',
+        return {
+          reason: queuedSignal.kind === 'look' ? 'look_request' : 'user_signal',
           signal: queuedSignal,
-        });
-      }
-
-      const initial = playbackRef.current;
-      if (
-        initial.status !== 'playing' ||
-        initial.currentTime === null ||
-        initial.currentTime < startPlaybackTime - 1 ||
-        initial.currentTime >= targetPlaybackTime
-      ) {
-        return Promise.resolve<ObservationWake>({ reason: 'interval' });
-      }
-
-      return new Promise<ObservationWake>((resolve) => {
-        const checkPlaybackTime = () => {
-          const waiter = observationWaiterRef.current;
-          if (!waiter) return;
-
-          const current = playbackRef.current;
-          if (
-            current.status !== 'playing' ||
-            current.currentTime === null ||
-            current.currentTime < startPlaybackTime - 1 ||
-            current.currentTime >= targetPlaybackTime
-          ) {
-            observationWaiterRef.current = null;
-            resolve({ reason: 'interval' });
-            return;
-          }
-
-          const nextTimerId = window.setTimeout(checkPlaybackTime, 100);
-          waiter.timerId = nextTimerId;
         };
+      }
 
-        const timerId = window.setTimeout(checkPlaybackTime, 100);
-        observationWaiterRef.current = { timerId, resolve };
-      });
-    },
-    [],
-  );
+      const events = timelineRef.current;
+      if (events.some((event) => event.type === 'stop_at')) return { reason: 'stop_at' };
+      if (events.some((event) => event.type === 'ended')) return { reason: 'ended' };
+
+      const cursor = observationCursorRef.current;
+      const mode = lookModeRef.current;
+      if (
+        mode !== 'request' &&
+        current.status === 'playing' &&
+        current.currentTime !== null &&
+        cursor?.nextCheckpointTime != null &&
+        current.currentTime >= cursor.nextCheckpointTime
+      ) {
+        return { reason: mode === 'interval' ? 'interval' : 'key_moment', signal: null };
+      }
+
+      if (events.length > 0) return { reason: 'playback_event', signal: null };
+
+      if (
+        pausedSinceRef.current !== null &&
+        Date.now() - Math.max(pausedSinceRef.current, loopStartedAtRef.current) > PAUSE_LIMIT_MS
+      ) {
+        return { reason: 'paused_too_long' };
+      }
+      if (Date.now() - startedAt > OBSERVER_HEARTBEAT_MS) {
+        return { reason: 'heartbeat', signal: null };
+      }
+      return null;
+    };
+
+    const immediate = nextWake();
+    if (immediate) return Promise.resolve(immediate);
+
+    return new Promise<ObservationWake>((resolve) => {
+      const check = () => {
+        const waiter = observationWaiterRef.current;
+        if (!waiter || waiter.resolve !== resolve) return;
+
+        const wake = nextWake();
+        if (wake) {
+          observationWaiterRef.current = null;
+          resolve(wake);
+          return;
+        }
+        waiter.timerId = window.setTimeout(check, 100);
+      };
+
+      observationWaiterRef.current = { timerId: window.setTimeout(check, 100), resolve };
+    });
+  }, []);
 
   useEffect(() => {
     const modelContext = document.modelContext;
@@ -955,8 +1079,9 @@ export default function Home() {
           playback: publicPlaybackState(playbackRef.current),
           protocol: {
             ...WATCH_PROTOCOL,
+            lookMode: lookModeRef.current,
             observationIntervalSeconds: observationIntervalRef.current,
-            observationIntervalBasis: 'video playback time',
+            keyMomentFallbackSeconds: KEY_MOMENT_FALLBACK_SECONDS,
             viewerReactionCooldownSeconds: VIEWER_REACTION_COOLDOWN_MS / 1_000,
             maxAgentReactionsPerCall: MAX_AGENT_REACTIONS,
             startTimecode: formatTimecode(sourceStartRef.current ?? Number.NaN),
@@ -964,18 +1089,18 @@ export default function Home() {
             stopAt:
               'When stopAtTimecode is set, the page pauses playback there and the observer returns STOP_AT_REACHED; end the loop and tell the viewer.',
             mediaMetadata:
-              'watch_get_session returns session-level media identity once. Observations are compact: wake reason, timecodes, and a short "next" reminder. If the video changes, the observer returns SESSION_CHANGED.',
+              'watch_get_session returns session-level media identity once. Observations are compact: wake reason, capture flag, status, timecode, any play/pause/seek events, and a short "next" reminder. If the video changes, the observer returns SESSION_CHANGED.',
             liveSignals:
-              'Any viewer emoji wakes watch_observe_next_moment immediately. It is intentional input inside the active watch-along, never an implicit request to pause or stop. Acknowledge it from the returned emoji, visible frame, and conversation context, then continue observing in the same turn while playback remains active.',
+              'A viewer emoji or Look now press wakes watch_observe_next_moment immediately with capture: true. It is intentional input inside the active watch-along, never an implicit request to pause or stop. Acknowledge it from the frame and conversation context, then continue observing in the same turn.',
             visualCapture:
-              'Use one programmatic browser call for the complete operation: preselect .player-frame, await watch_observe_next_moment, capture the rendered frame in the very next browser operation, and return the observation and image together. Do not invoke the observer as a standalone call and do not yield to model reasoning between the WebMCP result and capture. The frame includes the video, captions, and player overlays.',
+              'Capture .player-frame only when observation.capture is true, or when the viewer asks you to look. Capture in the same programmatic browser call that awaited the observer, with no model reasoning in between. The frame includes the video, captions, and player overlays.',
           },
         }),
       },
       {
         name: 'watch_observe_next_moment',
         description:
-          'Continue an active watch-along on a persistent media-time cursor. IMPORTANT: during active watching, never invoke this observer as a standalone call. Use one programmatic browser call that preselects the rendered .player-frame, awaits this WebMCP tool, captures that frame in the very next browser operation, and returns the structured observation and image to the model together. There must be zero model-reasoning turns between observer resolution and frame capture. The observer returns at the next scheduled checkpoint or immediately for any viewer emoji. At scheduled checkpoints, use the paired frame and conversation to decide whether to stay quiet, react, or comment. For a viewer emoji, always acknowledge the intentional signal in context, do not pause or end the watch-along solely because of it, and repeat the same paired observe-and-capture operation while playback remains active.',
+          'Continue an active watch-along. Run it inside one programmatic browser call: await this tool, and if observation.capture is true, capture the rendered .player-frame in the very next browser operation; return the observation (and image, if captured) together with no model reasoning in between. When capture is false, do not capture. The observer waits through pauses and wakes on the look-mode schedule, a viewer Look now request or emoji, play/pause/seek events (listed in observation.events), or a 30-second heartbeat. Use the frame and conversation to decide whether to stay quiet, react, or comment; always acknowledge a viewer emoji or look request. Keep calling it in the same turn until the user asks you to stop or it returns an error (ok: false). A new call safely replaces a pending one.',
         inputSchema: noInputSchema,
         annotations: { readOnlyHint: true },
         execute: async () => {
@@ -983,14 +1108,7 @@ export default function Home() {
           if (!initial.sourceUrl) {
             return webMcpError('NO_VIDEO', 'No video is open.', initial);
           }
-          if (initial.status !== 'playing') {
-            return webMcpError(
-              'PLAYBACK_NOT_PLAYING',
-              'Observation is available only while playback is active.',
-              initial,
-            );
-          }
-          if (initial.currentTime === null) {
+          if (initial.sourceKind === 'embed') {
             return webMcpError(
               'PLAYER_STATE_UNAVAILABLE',
               'This embedded player does not expose playback timing to the page.',
@@ -998,124 +1116,91 @@ export default function Home() {
             );
           }
 
-          if (observationWaiterRef.current) {
-            return webMcpError(
-              'OBSERVATION_ALREADY_PENDING',
-              'Another observation call is already waiting for the next moment.',
-              initial,
-            );
-          }
+          // A newer call replaces a stale pending one (for example after the
+          // viewer interrupted by voice) instead of failing.
+          releaseObservation({ reason: 'cancelled' });
+
+          const now = Date.now();
+          if (now - lastObserveAtRef.current > 60_000) loopStartedAtRef.current = now;
+          lastObserveAtRef.current = now;
 
           const observedSource = initial.sourceUrl;
-          const intervalSeconds = observationIntervalRef.current;
-          const discontinuitySequence = playbackDiscontinuitySequenceRef.current;
-          const storedCursor = observationCursorRef.current;
-          const canReuseCursor =
-            storedCursor?.sourceUrl === observedSource &&
-            storedCursor.intervalSeconds === intervalSeconds &&
-            storedCursor.discontinuitySequence === discontinuitySequence &&
-            initial.currentTime >= storedCursor.previousPlaybackTime - 1;
-          const cursor: ObservationCursor = canReuseCursor
-            ? storedCursor
-            : {
-                sourceUrl: observedSource,
-                intervalSeconds,
-                previousPlaybackTime: initial.currentTime,
-                nextCheckpointTime: initial.currentTime + intervalSeconds,
-                discontinuitySequence,
-              };
-          observationCursorRef.current = cursor;
+          if (observationCursorRef.current?.sourceUrl !== observedSource) {
+            observationCursorRef.current = { sourceUrl: observedSource, nextCheckpointTime: null };
+          }
+          const cursor = observationCursorRef.current;
+          const period =
+            lookModeRef.current === 'interval'
+              ? observationIntervalRef.current
+              : KEY_MOMENT_FALLBACK_SECONDS;
+          if (cursor.nextCheckpointTime === null && initial.currentTime !== null) {
+            // Take a first look soon after the watch-along starts.
+            cursor.nextCheckpointTime = initial.currentTime + Math.min(period, 5);
+          }
 
-          const wake = await waitForObservationWake(
-            initial.currentTime,
-            cursor.nextCheckpointTime,
-          );
+          const wake = await waitForObservationWake(observedSource);
+          lastObserveAtRef.current = Date.now();
           const current = playbackRef.current;
-
           if (wake.reason === 'cancelled') {
             return webMcpError(
-              'OBSERVATION_CANCELLED',
-              'The watch page stopped the pending observation.',
+              'OBSERVATION_SUPERSEDED',
+              'This call was replaced by a newer observer call or cancelled by the page. If you did not start a newer call, call watch_get_session.',
               current,
             );
           }
 
-          if (current.sourceUrl !== observedSource) {
+          const events = timelineRef.current;
+          timelineRef.current = [];
+          if (wake.reason === 'session_changed') {
             return webMcpError(
               'SESSION_CHANGED',
-              'The user changed the video during observation.',
+              'The user changed the video. Call watch_get_session before observing again.',
               current,
             );
           }
-          if (current.status !== 'playing') {
-            const stopAt = stopAtRef.current;
-            if (stopAt !== null && (current.currentTime ?? 0) >= stopAt - 1) {
-              return webMcpError(
-                'STOP_AT_REACHED',
-                `Paused at the viewer's stop-at time (${formatTimecode(stopAt)}). Stop the observation loop and let the viewer know.`,
-                current,
-              );
-            }
+          if (wake.reason === 'stop_at') {
             return webMcpError(
-              'PLAYBACK_STOPPED',
-              'Playback paused or ended. Stop the observation loop.',
+              'STOP_AT_REACHED',
+              `Paused at the viewer's stop-at time (${formatTimecode(stopAtRef.current)}). Stop the observation loop and let the viewer know.`,
               current,
             );
           }
-
-          const currentPlaybackTime = finiteTime(current.currentTime ?? Number.NaN);
-          if (currentPlaybackTime === null) {
+          if (wake.reason === 'ended') {
+            return webMcpError('PLAYBACK_ENDED', 'The video ended. Stop the observation loop.', current);
+          }
+          if (wake.reason === 'paused_too_long') {
             return webMcpError(
-              'PLAYER_STATE_UNAVAILABLE',
-              'The player stopped exposing playback timing during observation.',
+              'PAUSED_TOO_LONG',
+              'Playback has been paused for over 10 minutes. Stop the observation loop; the viewer can ask you to resume watching.',
               current,
             );
           }
 
-          const currentDiscontinuitySequence = playbackDiscontinuitySequenceRef.current;
-          const seekDetected =
-            currentDiscontinuitySequence !== cursor.discontinuitySequence ||
-            currentPlaybackTime < cursor.previousPlaybackTime - 1;
-          const crossedCheckpointCount =
-            seekDetected || currentPlaybackTime < cursor.nextCheckpointTime
-              ? 0
-              : Math.floor(
-                  (currentPlaybackTime - cursor.nextCheckpointTime) / intervalSeconds,
-                ) + 1;
-          const nextCheckpointTime = seekDetected
-            ? currentPlaybackTime + intervalSeconds
-            : cursor.nextCheckpointTime + crossedCheckpointCount * intervalSeconds;
+          const capture = CAPTURE_WAKES.includes(wake.reason);
+          if (capture && current.currentTime !== null) {
+            cursor.nextCheckpointTime = current.currentTime + period;
+          }
 
-          observationCursorRef.current = {
-            sourceUrl: observedSource,
-            intervalSeconds,
-            previousPlaybackTime: currentPlaybackTime,
-            nextCheckpointTime,
-            discontinuitySequence: currentDiscontinuitySequence,
-          };
-
-          // Kept deliberately small: this payload repeats at every checkpoint and
+          // Kept deliberately small: this payload repeats all session and
           // accumulates in the conversation. The full protocol lives in
           // watch_get_session and the tool description, which are sent once.
-          const missedCheckpoints = Math.max(0, crossedCheckpointCount - 1);
-          const stopAt = stopAtRef.current;
-
+          const signal = 'signal' in wake ? wake.signal : null;
           return {
             ok: true,
             observation: {
               wakeReason: wake.reason,
-              ...(wake.reason === 'user_signal'
-                ? { signal: { emoji: wake.signal.emoji, timecode: wake.signal.timecode } }
-                : {}),
-              timecode: formatTimecode(currentPlaybackTime),
-              previousTimecode: formatTimecode(cursor.previousPlaybackTime),
-              ...(seekDetected ? { seekDetected: true } : {}),
-              ...(missedCheckpoints > 0 ? { missedCheckpoints } : {}),
-              ...(stopAt !== null ? { stopAtTimecode: formatTimecode(stopAt) } : {}),
-              next:
-                wake.reason === 'user_signal'
-                  ? 'Capture .player-frame now, acknowledge the emoji, keep playing, observe again.'
-                  : 'Capture .player-frame now, then observe again unless the user asked to stop.',
+              capture,
+              status: current.status,
+              timecode: formatTimecode(current.currentTime),
+              ...(signal?.emoji ? { signal: { emoji: signal.emoji, timecode: signal.timecode } } : {}),
+              ...(events.length > 0 ? { events } : {}),
+              next: capture
+                ? wake.reason === 'look_request'
+                  ? 'The viewer asked you to look. Capture .player-frame now, respond, then observe again.'
+                  : wake.reason === 'user_signal'
+                    ? 'Capture .player-frame, briefly acknowledge the emoji, then observe again.'
+                    : 'Capture .player-frame; comment only if worthwhile. Then observe again.'
+                : 'No capture needed. Observe again.',
             },
           };
         },
@@ -1135,12 +1220,20 @@ export default function Home() {
             );
           }
           const played = await controller.play();
-          await wait(180);
-          return played
+          if (!played) {
+            return webMcpError(
+              'PLAY_REJECTED',
+              'The browser or player rejected playback.',
+              playbackRef.current,
+            );
+          }
+          // YouTube buffers briefly before playing; report the settled state.
+          const playing = await waitForStatus(playbackRef, ['playing'], 6_000);
+          return playing
             ? { ok: true, playback: publicPlaybackState(playbackRef.current) }
             : webMcpError(
-                'PLAY_REJECTED',
-                'The browser or player rejected playback.',
+                'PLAY_NOT_STARTED',
+                'Play was requested but the video has not started yet (still buffering, or the browser blocked autoplay). Ask the viewer to press play.',
                 playbackRef.current,
               );
         },
@@ -1159,8 +1252,9 @@ export default function Home() {
               playbackRef.current,
             );
           }
-          const paused = await controller.pause();
-          await wait(120);
+          const paused =
+            (await controller.pause()) &&
+            (await waitForStatus(playbackRef, ['paused', 'ended'], 2_000));
           return paused
             ? { ok: true, playback: publicPlaybackState(playbackRef.current) }
             : webMcpError(
@@ -1168,6 +1262,69 @@ export default function Home() {
                 'The player rejected the pause request.',
                 playbackRef.current,
               );
+        },
+      },
+      {
+        name: 'watch_configure',
+        description:
+          'Change watch settings when the viewer asks, e.g. "only look when I ask" (lookMode request), "look at key moments" (moments), "check every 10 seconds" (interval + intervalSeconds), or "stop at one hour" (stopAt "1:00:00"; empty string clears it). This visibly updates the page controls.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            lookMode: { type: 'string', enum: ['request', 'moments', 'interval'] },
+            intervalSeconds: { type: 'number', enum: OBSERVATION_INTERVALS_SECONDS },
+            stopAt: {
+              type: 'string',
+              description: 'Time to pause at, like "1:00:00", "45m", or "3600". Empty clears it.',
+            },
+          },
+          additionalProperties: false,
+        },
+        execute: async (input) => {
+          const options = (typeof input === 'object' && input !== null ? input : {}) as {
+            lookMode?: unknown;
+            intervalSeconds?: unknown;
+            stopAt?: unknown;
+          };
+          const lookModeInput = options.lookMode;
+          const intervalInput = options.intervalSeconds;
+          const stopAtInput = options.stopAt;
+
+          if (
+            lookModeInput !== undefined &&
+            !['request', 'moments', 'interval'].includes(lookModeInput as string)
+          ) {
+            return webMcpError('INVALID_OPTION', 'lookMode must be request, moments, or interval.', playbackRef.current);
+          }
+          if (
+            intervalInput !== undefined &&
+            !OBSERVATION_INTERVALS_SECONDS.includes(intervalInput as ObservationIntervalSeconds)
+          ) {
+            return webMcpError('INVALID_OPTION', 'intervalSeconds must be 5, 10, or 15.', playbackRef.current);
+          }
+          if (
+            stopAtInput !== undefined &&
+            (typeof stopAtInput !== 'string' ||
+              (stopAtInput.trim() !== '' && parseTimeInput(stopAtInput) === null))
+          ) {
+            return webMcpError('INVALID_OPTION', 'stopAt must look like "1:00:00", "45m", or "3600".', playbackRef.current);
+          }
+
+          if (lookModeInput !== undefined || intervalInput !== undefined) {
+            changeLookMode(
+              (lookModeInput as LookMode | undefined) ??
+                (intervalInput !== undefined ? 'interval' : lookModeRef.current),
+              intervalInput as ObservationIntervalSeconds | undefined,
+            );
+          }
+          if (typeof stopAtInput === 'string') changeStopAt(stopAtInput);
+
+          return {
+            ok: true,
+            lookMode: lookModeRef.current,
+            intervalSeconds: observationIntervalRef.current,
+            stopAtTimecode: formatTimecode(stopAtRef.current ?? Number.NaN),
+          };
         },
       },
       {
@@ -1248,12 +1405,37 @@ export default function Home() {
       }
       delete document.documentElement.dataset.siteTools;
     };
-  }, [publishVisualReactions, releaseObservation, waitForObservationWake]);
+  }, [changeLookMode, changeStopAt, publishVisualReactions, releaseObservation, waitForObservationWake]);
+
+  function resetTimeline() {
+    observationCursorRef.current = null;
+    timelineRef.current = [];
+    settledStatusRef.current = null;
+    pausedSinceRef.current = null;
+  }
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     try {
-      const parsedSource = parseVideoSource(videoUrl);
+      const linkedSource = parseVideoSource(videoUrl);
+      const plannedStart = parseTimeInput(plannedStartText);
+      const plannedStop = parseTimeInput(plannedStopText);
+      if (plannedStartText.trim() && plannedStart === null) {
+        throw new Error('Start time should look like 1:00:00, 45m, or 3600.');
+      }
+      if (plannedStopText.trim() && plannedStop === null) {
+        throw new Error('Stop time should look like 1:00:00, 45m, or 3600.');
+      }
+      // A start time typed here wins over a t= in the link.
+      const parsedSource: VideoSource =
+        linkedSource.kind !== 'embed' && plannedStart !== null
+          ? { ...linkedSource, startSeconds: plannedStart }
+          : linkedSource;
+      const effectiveStart =
+        parsedSource.kind === 'embed' ? null : (parsedSource.startSeconds ?? 0);
+      if (plannedStop !== null && effectiveStart !== null && plannedStop <= effectiveStart) {
+        throw new Error('Stop time must be after the start time.');
+      }
       const sessionId = `media-${Date.now()}-${mediaSessionSequenceRef.current++}`;
       const nextMetadata = initialMediaMetadata(parsedSource, sessionId);
       const nextPlayback: PlaybackSnapshot = {
@@ -1266,10 +1448,9 @@ export default function Home() {
       };
       playbackRef.current = nextPlayback;
       playbackSampleRef.current = null;
-      playbackDiscontinuitySequenceRef.current = 0;
-      observationCursorRef.current = null;
+      resetTimeline();
       sourceStartRef.current = parsedSource.kind === 'embed' ? null : parsedSource.startSeconds;
-      changeStopAt('');
+      changeStopAt(plannedStop !== null ? plannedStopText.trim() : '');
       setSource(parsedSource);
       setMediaMetadata(nextMetadata);
       mediaMetadataRef.current = nextMetadata;
@@ -1292,8 +1473,7 @@ export default function Home() {
     mediaMetadataRef.current = null;
     playbackRef.current = EMPTY_PLAYBACK;
     playbackSampleRef.current = null;
-    playbackDiscontinuitySequenceRef.current = 0;
-    observationCursorRef.current = null;
+    resetTimeline();
     sourceStartRef.current = null;
     changeStopAt('');
     setPlaybackStatus('idle');
@@ -1308,7 +1488,7 @@ export default function Home() {
         <section className="start-content" aria-labelledby="page-title">
           <p className="eyebrow">Watch with GPT</p>
           <h1 id="page-title">Watch something together.</h1>
-          <form className="link-form" onSubmit={submit}>
+          <form className="link-form" id="link-form" onSubmit={submit}>
             <label className="sr-only" htmlFor="video-url">
               Video link
             </label>
@@ -1328,6 +1508,32 @@ export default function Home() {
               <span aria-hidden="true">→</span>
             </button>
           </form>
+          <div className="planned-times">
+            <label className="time-field">
+              <span>Start at</span>
+              <input
+                form="link-form"
+                type="text"
+                value={plannedStartText}
+                onChange={(event) => setPlannedStartText(event.target.value)}
+                placeholder="from link"
+                aria-invalid={Boolean(plannedStartText.trim()) && parseTimeInput(plannedStartText) === null}
+                title="Optional. Overrides any t= in the link, e.g. 1:00:00 or 45m"
+              />
+            </label>
+            <label className="time-field">
+              <span>Stop at</span>
+              <input
+                form="link-form"
+                type="text"
+                value={plannedStopText}
+                onChange={(event) => setPlannedStopText(event.target.value)}
+                placeholder="h:mm:ss"
+                aria-invalid={Boolean(plannedStopText.trim()) && parseTimeInput(plannedStopText) === null}
+                title="Optional. Pause automatically at this time, e.g. 2:00:00 or 90m"
+              />
+            </label>
+          </div>
           {error ? (
             <p className="input-message input-error" id="video-error" role="alert">
               {error}
@@ -1440,24 +1646,57 @@ export default function Home() {
             </span>
           </div>
 
-          <div className="observation-picker" aria-label="GPT observation interval">
-            <span>Check every</span>
-            {OBSERVATION_INTERVALS_SECONDS.map((seconds) => (
-              <button
-                type="button"
-                key={seconds}
-                className="interval-button"
-                data-active={seconds === observationIntervalSeconds}
-                aria-pressed={seconds === observationIntervalSeconds}
-                onClick={() => setObservationIntervalSeconds(seconds)}
-              >
-                {seconds}s
-              </button>
-            ))}
+          <div className="observation-picker" aria-label="When GPT looks at the video">
+            <span>Look</span>
+            <button
+              type="button"
+              className="interval-button"
+              data-active={lookMode === 'request'}
+              aria-pressed={lookMode === 'request'}
+              title="Only when you press Look now, send an emoji, or ask out loud"
+              onClick={() => changeLookMode('request')}
+            >
+              On request
+            </button>
+            <button
+              type="button"
+              className="interval-button"
+              data-active={lookMode === 'moments'}
+              aria-pressed={lookMode === 'moments'}
+              title={`On request, after you jump to a new spot, and every ${KEY_MOMENT_FALLBACK_SECONDS}s as a fallback`}
+              onClick={() => changeLookMode('moments')}
+            >
+              Key moments
+            </button>
+            {OBSERVATION_INTERVALS_SECONDS.map((seconds) => {
+              const active = lookMode === 'interval' && seconds === observationIntervalSeconds;
+              return (
+                <button
+                  type="button"
+                  key={seconds}
+                  className="interval-button"
+                  data-active={active}
+                  aria-pressed={active}
+                  title={`Every ${seconds} seconds of playback`}
+                  onClick={() => changeLookMode('interval', seconds)}
+                >
+                  {seconds}s
+                </button>
+              );
+            })}
           </div>
 
+          <button
+            type="button"
+            className="look-now-button"
+            onClick={() => publishUserSignal('look')}
+            title="Ask GPT to look at the current frame"
+          >
+            Look now
+          </button>
+
           {source.kind !== 'embed' ? (
-            <label className="stop-at">
+            <label className="time-field">
               <span>Stop at</span>
               <input
                 type="text"

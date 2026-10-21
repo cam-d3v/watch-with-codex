@@ -392,7 +392,7 @@ h1 {
   color: var(--text);
 }
 
-.stop-at {
+.time-field {
   display: flex;
   align-items: center;
   gap: 7px;
@@ -400,7 +400,7 @@ h1 {
   font-size: 11px;
 }
 
-.stop-at input {
+.time-field input {
   width: 76px;
   height: 28px;
   padding: 0 8px;
@@ -411,13 +411,39 @@ h1 {
   font: inherit;
 }
 
-.stop-at input:focus-visible {
+.time-field input:focus-visible {
   outline: 0;
   border-color: var(--border-strong);
 }
 
-.stop-at input[aria-invalid='true'] {
+.time-field input[aria-invalid='true'] {
   border-color: #e5484d;
+}
+
+.planned-times {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  margin-top: 14px;
+}
+
+.look-now-button {
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  transition: background 150ms ease;
+}
+
+.look-now-button:hover,
+.look-now-button:focus-visible {
+  outline: 0;
+  background: var(--surface-hover);
 }
 
 .player-note {
