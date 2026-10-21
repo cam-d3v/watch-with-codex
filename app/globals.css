@@ -509,6 +509,47 @@ h1 {
   }
 }
 
+/* Video only: the player covers the window so any screenshot is just the video. */
+.watch-screen[data-video-only='true'] .player-frame {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  width: 100vw;
+  height: 100dvh;
+  aspect-ratio: auto;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.video-only-bar {
+  position: fixed;
+  z-index: 30;
+  top: 0;
+  left: 0;
+  display: flex;
+  gap: 6px;
+  padding: 10px;
+  opacity: 0;
+  transition: opacity 150ms ease;
+}
+
+.video-only-bar:hover,
+.video-only-bar:focus-within {
+  opacity: 1;
+}
+
+.video-only-bar button {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.72);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 11px;
+}
+
 .watch-header-actions {
   display: flex;
   gap: 6px;

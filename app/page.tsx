@@ -55,13 +55,15 @@ const WAKE_LABELS: Record<WakeReason, string> = {
   heartbeat: 'heartbeat',
 };
 // The one-line reminder each observation carries, by wake reason.
+// Capture wakes include captureTarget; "only" steers agents away from full-page screenshots.
 const NEXT_STEP: Record<WakeReason, string> = {
-  look_request: 'The viewer asked you to look. Capture .player-frame now, respond, then observe again.',
+  look_request:
+    'The viewer asked you to look. Capture only captureTarget (not the full page), respond, then observe again.',
   mark_request:
-    'The viewer marked this moment. Capture .player-frame, call watch_add_note with markId and a one-line description, then observe again.',
-  user_signal: 'Capture .player-frame, briefly acknowledge the emoji, then observe again.',
-  interval: 'Capture .player-frame; comment only if worthwhile. Then observe again.',
-  key_moment: 'Capture .player-frame; comment only if worthwhile. Then observe again.',
+    'The viewer marked this moment. Capture only captureTarget, call watch_add_note with markId, observationSeq and a one-line description, then observe again.',
+  user_signal: 'Capture only captureTarget, briefly acknowledge the emoji, then observe again.',
+  interval: 'Capture only captureTarget; comment only if worthwhile. Then observe again.',
+  key_moment: 'Capture only captureTarget; comment only if worthwhile. Then observe again.',
   playback_event: 'No capture needed. Observe again.',
   heartbeat: 'No capture needed. Observe again.',
 };
@@ -161,7 +163,9 @@ type Note = {
   text: string;
   // mark: the viewer pressed Mark and GPT is asked to describe the moment.
   source: 'viewer' | 'gpt' | 'mark';
+  // The check-in whose frame the note describes, and where playback was then.
   observationSeq: number | null;
+  observationTime?: number | null;
   createdAt: string;
 };
 
@@ -342,6 +346,22 @@ function parseTimeInput(value: string): number | null {
   return hours * 3600 + minutes * 60 + seconds;
 }
 
+// Where the video is on the page, so the agent can screenshot just the player.
+function playerCaptureTarget() {
+  const frame = document.querySelector('.player-frame');
+  if (!frame) return { selector: '.player-frame' };
+  const rect = frame.getBoundingClientRect();
+  return {
+    selector: '.player-frame',
+    clip: {
+      x: Math.round(rect.left + window.scrollX),
+      y: Math.round(rect.top + window.scrollY),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    },
+  };
+}
+
 function signalWakeReason(signal: UserSignal): WakeReason {
   if (signal.kind === 'look') return 'look_request';
   if (signal.kind === 'mark') return 'mark_request';
@@ -395,7 +415,15 @@ function notesToMarkdown(source: VideoSource, title: string | null, notes: Note[
     const late = noteWrittenLateSeconds(note);
     const by =
       note.source === 'viewer' ? 'me' : note.source === 'mark' ? 'marked by me, described by GPT' : 'GPT';
-    const details = [by, late ? `written ${late}s later` : null].filter(Boolean).join(', ');
+    const details = [
+      by,
+      note.observationSeq !== null
+        ? `check #${note.observationSeq}${note.observationTime != null ? ` at ${shortTimecode(note.observationTime)}` : ''}`
+        : null,
+      late ? `written ${late}s later at ${shortTimecode(note.writtenAt)}` : null,
+    ]
+      .filter(Boolean)
+      .join(', ');
     lines.push(
       `- **${link ? `[${stamp}](${link})` : stamp}** ${note.text || '(marked, no description yet)'} _(${details})_`,
     );
@@ -857,6 +885,24 @@ export default function Home() {
   const [notesMessage, setNotesMessage] = useState('');
   const noteSequenceRef = useRef(0);
   const sourceRef = useRef<VideoSource | null>(null);
+  // Playback time of each observation, by seq, so notes can record when their frame was taken.
+  const observationTimesRef = useRef(new Map<number, number | null>());
+  const [videoOnly, setVideoOnly] = useState(false);
+  const videoOnlyRef = useRef(false);
+
+  const changeVideoOnly = useCallback((enabled: boolean) => {
+    videoOnlyRef.current = enabled;
+    setVideoOnly(enabled);
+  }, []);
+
+  useEffect(() => {
+    if (!videoOnly) return;
+    const exitOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') changeVideoOnly(false);
+    };
+    document.addEventListener('keydown', exitOnEscape);
+    return () => document.removeEventListener('keydown', exitOnEscape);
+  }, [changeVideoOnly, videoOnly]);
 
   // Single place notes change: updates state, the ref the tools read, and storage.
   const commitNotes = useCallback((next: Note[]) => {
@@ -886,6 +932,10 @@ export default function Home() {
         text: fields.text.slice(0, MAX_NOTE_LENGTH),
         source: fields.source,
         observationSeq: fields.observationSeq ?? null,
+        observationTime:
+          fields.observationSeq != null
+            ? (observationTimesRef.current.get(fields.observationSeq) ?? null)
+            : null,
         createdAt: new Date().toISOString(),
       };
       commitNotes([...notesRef.current, note]);
@@ -1309,7 +1359,8 @@ export default function Home() {
             liveSignals:
               'A viewer emoji or Look now press wakes watch_observe_next_moment immediately with capture: true. It is intentional input inside the active watch-along, never an implicit request to pause or stop. Acknowledge it from the frame and conversation context, then continue observing in the same turn.',
             visualCapture:
-              'Capture .player-frame only when observation.capture is true, or when the viewer asks you to look. Capture in the same programmatic browser call that awaited the observer, with no model reasoning in between. The frame includes the video, captions, and player overlays.',
+              'Capture only when observation.capture is true, or when the viewer asks you to look, in the same programmatic browser call that awaited the observer, with no model reasoning in between. Capture only the video: an element screenshot of captureTarget.selector (.player-frame), or a clip of captureTarget.clip (CSS pixels, page coordinates). Never capture the full page or viewport; it wastes tokens and includes unrelated UI. If your browser can only capture the viewport, call watch_configure with videoOnly: true first; the video then fills the window. The frame includes the video, captions, and player overlays.',
+            videoOnly: videoOnlyRef.current,
           },
         }),
       },
@@ -1426,6 +1477,11 @@ export default function Home() {
           }
           const seq = ++observationSeqRef.current;
           const timecode = formatTimecode(current.currentTime);
+          observationTimesRef.current.set(seq, finiteTime(current.currentTime ?? Number.NaN));
+          if (observationTimesRef.current.size > 500) {
+            const oldest = observationTimesRef.current.keys().next().value;
+            if (oldest !== undefined) observationTimesRef.current.delete(oldest);
+          }
           setObserverStatus({
             waiting: false,
             endedAt: Date.now(),
@@ -1443,6 +1499,16 @@ export default function Home() {
           // accumulates in the conversation. The full protocol lives in
           // watch_get_session and the tool description, which are sent once.
           const signal = 'signal' in wake ? wake.signal : null;
+          if (signal?.markId) {
+            // Tie the mark to the check-in that delivered it, even if the
+            // agent later omits observationSeq.
+            const observationTime = finiteTime(current.currentTime ?? Number.NaN);
+            commitNotes(
+              notesRef.current.map((note) =>
+                note.id === signal.markId ? { ...note, observationSeq: seq, observationTime } : note,
+              ),
+            );
+          }
           return {
             ok: true,
             observation: {
@@ -1454,6 +1520,7 @@ export default function Home() {
               ...(signal?.emoji ? { signal: { emoji: signal.emoji, timecode: signal.timecode } } : {}),
               ...(signal?.markId ? { markId: signal.markId, markTimecode: signal.timecode } : {}),
               ...(events.length > 0 ? { events } : {}),
+              ...(capture ? { captureTarget: playerCaptureTarget() } : {}),
               next: NEXT_STEP[wake.reason as WakeReason],
             },
           };
@@ -1531,7 +1598,7 @@ export default function Home() {
       {
         name: 'watch_configure',
         description:
-          'Change watch settings when the viewer asks, e.g. "only look when I ask" (lookMode request), "look at key moments" (moments), "check every 10 seconds" (interval + intervalSeconds), or "stop at one hour" (stopAt "1:00:00"; empty string clears it). This visibly updates the page controls.',
+          'Change watch settings when the viewer asks, e.g. "only look when I ask" (lookMode request), "look at key moments" (moments), "check every 10 seconds" (interval + intervalSeconds), or "stop at one hour" (stopAt "1:00:00"; empty string clears it). videoOnly: true makes the video fill the window and hides other UI, so a viewport screenshot contains only the video; use it when you cannot capture just .player-frame, or when the viewer asks. This visibly updates the page.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -1541,6 +1608,7 @@ export default function Home() {
               type: 'string',
               description: 'Time to pause at, like "1:00:00", "45m", or "3600". Empty clears it.',
             },
+            videoOnly: { type: 'boolean' },
           },
           additionalProperties: false,
         },
@@ -1549,7 +1617,11 @@ export default function Home() {
             lookMode?: unknown;
             intervalSeconds?: unknown;
             stopAt?: unknown;
+            videoOnly?: unknown;
           };
+          if (options.videoOnly !== undefined && typeof options.videoOnly !== 'boolean') {
+            return webMcpError('INVALID_OPTION', 'videoOnly must be true or false.', playbackRef.current);
+          }
           const lookModeInput = options.lookMode;
           const intervalInput = options.intervalSeconds;
           const stopAtInput = options.stopAt;
@@ -1582,12 +1654,18 @@ export default function Home() {
             );
           }
           if (typeof stopAtInput === 'string') changeStopAt(stopAtInput);
+          if (typeof options.videoOnly === 'boolean') {
+            changeVideoOnly(options.videoOnly);
+            // Let the layout settle so the next screenshot sees the new view.
+            await wait(200);
+          }
 
           return {
             ok: true,
             lookMode: lookModeRef.current,
             intervalSeconds: observationIntervalRef.current,
             stopAtTimecode: formatTimecode(stopAtRef.current ?? Number.NaN),
+            videoOnly: videoOnlyRef.current,
           };
         },
       },
@@ -1642,7 +1720,12 @@ export default function Home() {
               ...mark,
               text: text.slice(0, MAX_NOTE_LENGTH),
               writtenAt: now,
-              observationSeq: observationSeq ?? mark.observationSeq,
+              ...(observationSeq !== null
+                ? {
+                    observationSeq,
+                    observationTime: observationTimesRef.current.get(observationSeq) ?? null,
+                  }
+                : {}),
             };
             commitNotes(notesRef.current.map((note) => (note.id === mark.id ? described : note)));
             return { ok: true, noteId: described.id, timecode: formatTimecode(described.time) };
@@ -1678,6 +1761,13 @@ export default function Home() {
               timecode: formatTimecode(note.time),
               text: note.text || null,
               by: note.source,
+              ...(note.observationSeq !== null
+                ? {
+                    observationSeq: note.observationSeq,
+                    observationTimecode: formatTimecode(note.observationTime ?? null),
+                  }
+                : {}),
+              ...(note.writtenAt !== null ? { writtenAtTimecode: formatTimecode(note.writtenAt) } : {}),
               ...(noteWrittenLateSeconds(note)
                 ? { writtenLaterSeconds: noteWrittenLateSeconds(note) }
                 : {}),
@@ -1765,6 +1855,7 @@ export default function Home() {
   }, [
     changeLookMode,
     changeStopAt,
+    changeVideoOnly,
     commitNotes,
     createNote,
     publishVisualReactions,
@@ -1972,7 +2063,21 @@ export default function Home() {
   }
 
   return (
-    <main className="watch-screen" data-notes-open={notesOpen}>
+    <main className="watch-screen" data-notes-open={notesOpen} data-video-only={videoOnly}>
+      {videoOnly ? (
+        // Invisible until hovered, so viewport screenshots still show only the video.
+        <div className="video-only-bar">
+          <button type="button" onClick={() => changeVideoOnly(false)}>
+            Exit video only (Esc)
+          </button>
+          <button type="button" onClick={() => publishUserSignal('look')}>
+            Look now
+          </button>
+          <button type="button" onClick={markMoment}>
+            Mark
+          </button>
+        </div>
+      ) : null}
       <header className="watch-header">
         <button type="button" className="wordmark" onClick={reset}>
           Watch with GPT
@@ -2144,6 +2249,14 @@ export default function Home() {
                 Mark
               </button>
             ) : null}
+            <button
+              type="button"
+              className="look-now-button"
+              onClick={() => changeVideoOnly(true)}
+              title="Make the video fill the window so screenshots contain only the video"
+            >
+              Video only
+            </button>
 
             {source.kind !== 'embed' ? (
               <label className="time-field">
@@ -2229,7 +2342,9 @@ export default function Home() {
                           <p className="note-meta">
                             {note.source === 'viewer' ? 'You' : note.source === 'mark' ? 'Your mark' : 'GPT'}
                             {note.source === 'mark' && note.text ? ', described by GPT' : ''}
-                            {note.observationSeq !== null ? ` · check #${note.observationSeq}` : ''}
+                            {note.observationSeq !== null
+                              ? ` · check #${note.observationSeq}${note.observationTime != null ? ` at ${shortTimecode(note.observationTime)}` : ''}`
+                              : ''}
                             {late ? ` · written ${late}s later` : ''}
                           </p>
                         </div>
